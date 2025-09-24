@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.ipynb_checkpoints
+
+# Streamlit cache
+.streamlit/cache/
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
