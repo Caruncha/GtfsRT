@@ -11,7 +11,8 @@ Fonctions :
 - Exporte : summary.md, summary.json, summary.html, summary_graphs.html,
             trips.csv, stop_updates.csv, anomalies.csv, (optionnel) schedule_compare.csv
 
-Installation locale : pip install pandas gtfs-realtime-bindings altair tzdata numpy
+Installation locale :
+  pip install pandas gtfs-realtime-bindings altair tzdata numpy
 """
 
 import argparse
@@ -89,9 +90,7 @@ def time_to_seconds_24hplus(hms: str) -> Optional[int]:
         return None
 
 def trip_key(trip, entity_id: str) -> Tuple[str, str, str]:
-    """
-    Clé de voyage pour distinguer les réalisations d'un même trip_id selon date/heure de départ.
-    """
+    """Clé de voyage pour distinguer les réalisations d'un même trip_id selon date/heure de départ."""
     tid = getattr(trip, "trip_id", "") or ""
     sd  = getattr(trip, "start_date", "") or ""
     st  = getattr(trip, "start_time", "") or ""
@@ -364,7 +363,6 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
             dep_time = stu.departure.time if (stu.HasField("departure") and stu.departure.HasField("time")) else None
             arr_delay = stu.arrival.delay if (stu.HasField("arrival") and stu.arrival.HasField("delay")) else None
             dep_delay = stu.departure.delay if (stu.HasField("departure") and stu.departure.HasField("delay")) else None
-
             if arr_time is None and dep_time is None and arr_delay is None and dep_delay is None:
                 empty_time_fields += 1
 
@@ -725,6 +723,9 @@ def build_graphical_report_html(analysis: Dict, tz_str: Optional[str] = None) ->
     """
     Construit une page HTML synthétique avec graphiques Altair (autonome, scripts via CDN).
     """
+    # Désactive la limite 5k lignes d'Altair pour cet export
+    alt.data_transformers.enable('default', max_rows=None)
+
     tz = tz_str or analysis.get("static_meta", {}).get("default_timezone", "UTC")
 
     trips_df = analysis["trips_df"].copy()
@@ -763,12 +764,23 @@ def build_graphical_report_html(analysis: Dict, tz_str: Optional[str] = None) ->
     # 4) Annulations 10 min
     series_cancel = _compute_trip_cancellations_10min(trips_df, stu_df, tz)
 
-    # 5) Histogrammes des écarts (si dispo)
+    # 5) Histogrammes des écarts (pré-agrégés en 60 bacs)
     hist_arr_df = pd.DataFrame()
     hist_dep_df = pd.DataFrame()
     if not sched_df.empty:
-        hist_arr_df = pd.DataFrame({"delta_min": pd.to_numeric(sched_df["arr_delta_sec"], errors="coerce")/60.0}).dropna()
-        hist_dep_df = pd.DataFrame({"delta_min": pd.to_numeric(sched_df["dep_delta_sec"], errors="coerce")/60.0}).dropna()
+        s_arr = pd.to_numeric(sched_df["arr_delta_sec"], errors="coerce") / 60.0
+        s_dep = pd.to_numeric(sched_df["dep_delta_sec"], errors="coerce") / 60.0
+
+        def _hist_counts(series: pd.Series, bins: int = 60) -> pd.DataFrame:
+            s = series.dropna()
+            if s.empty:
+                return pd.DataFrame(columns=["bin_center", "count"])
+            counts, edges = np.histogram(s, bins=bins)
+            centers = (edges[:-1] + edges[1:]) / 2.0
+            return pd.DataFrame({"bin_center": centers, "count": counts})
+
+        hist_arr_df = _hist_counts(s_arr, bins=60)
+        hist_dep_df = _hist_counts(s_dep, bins=60)
 
     # 6) Top 20 SKIPPED
     top_sk_df = pd.DataFrame()
@@ -779,7 +791,6 @@ def build_graphical_report_html(analysis: Dict, tz_str: Optional[str] = None) ->
                            .sort_values("compte", ascending=False).head(20))
 
     charts = {}
-
     if not df_summary.empty:
         charts["summary_bar"] = (alt.Chart(df_summary)
                                   .mark_bar()
@@ -818,20 +829,25 @@ def build_graphical_report_html(analysis: Dict, tz_str: Optional[str] = None) ->
                                    .properties(height=320, title="Annulations de voyages (complètes vs partielles)"))
 
     if not hist_arr_df.empty:
-        charts["hist_arr"] = (alt.Chart(hist_arr_df)
-                                .mark_bar()
-                                .encode(x=alt.X("delta_min:Q", bin=alt.Bin(maxbins=60),
-                                                title="Écart arrival (minutes, +retard / -avance)"),
-                                        y=alt.Y("count():Q", title="Nombre"))
-                                .properties(height=300, title="Histogramme des écarts — Arrival"))
-
+        charts["hist_arr"] = (
+            alt.Chart(hist_arr_df)
+               .mark_bar()
+               .encode(
+                   x=alt.X("bin_center:Q", title="Écart arrival (minutes, +retard / -avance)"),
+                   y=alt.Y("count:Q", title="Nombre")
+               )
+               .properties(height=300, title="Histogramme des écarts — Arrival")
+        )
     if not hist_dep_df.empty:
-        charts["hist_dep"] = (alt.Chart(hist_dep_df)
-                                .mark_bar()
-                                .encode(x=alt.X("delta_min:Q", bin=alt.Bin(maxbins=60),
-                                                title="Écart departure (minutes)"),
-                                        y=alt.Y("count():Q", title="Nombre"))
-                                .properties(height=300, title="Histogramme des écarts — Departure"))
+        charts["hist_dep"] = (
+            alt.Chart(hist_dep_df)
+               .mark_bar()
+               .encode(
+                   x=alt.X("bin_center:Q", title="Écart departure (minutes)"),
+                   y=alt.Y("count:Q", title="Nombre")
+               )
+               .properties(height=300, title="Histogramme des écarts — Departure")
+        )
 
     if not top_sk_df.empty:
         charts["top_skipped"] = (alt.Chart(top_sk_df)
@@ -856,9 +872,9 @@ h1,h2 {{ color:#222; }}
 .card {{ border:1px solid #e5e5e5; border-radius:8px; padding:16px; }}
 small {{ color:#666; }}
 </style>
-https://cdn.jsdelivr.net/npm/vega@5</script>
-https://cdn.jsdelivr.net/npm/vega-lite@5</script>
-https://cdn.jsdelivr.net/npm/vega-embed@6</script>
+<script src.jsdelivr.net/npm/vega@5</script>
+<script src="https://net/npm/vega-lite@5</script>
+<script/cdn.jsdelivr.net/npm/vega-embed@6</script>
 </head>
 <body>
 <h1>Rapport GTFS-rt — TripUpdates (graphique)</h1>
@@ -884,7 +900,7 @@ https://cdn.jsdelivr.net/npm/vega-embed@6</script>
 
 <script>
 const specs = {{
-  {", ".join([f'"{k}": {v}' for k,v in specs.items()])}
+  {", ".join([f'"{k}": {v}' for k, v in specs.items()])}
 }};
 for (const id in specs) {{
   const el = document.getElementById(id);
