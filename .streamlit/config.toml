@@ -1,0 +1,5 @@
+# .streamlit/config.toml
+[server]
+fileWatcherType = "poll"   # évite inotify
+maxUploadSize = 200        # (optionnel) augmente la limite d'upload
+runOnSave = false          # (optionnel) évite des reloads fréquents
