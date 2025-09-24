@@ -26,8 +26,6 @@ st.write(
     "Charge un fichier **TripUpdates (Protocol Buffer)** (extension libre) et, optionnellement, un **GTFS statique** "
     "pour des validations avancées et la comparaison au planifié. Utilise les filtres pour explorer, et télécharge les résultats."
 )
-st.write("type(analysis) =", type(analysis))
-st.write("analysis keys =", list(analysis.keys()) if isinstance(analysis, dict) else None)
 
 # -----------------------------------------------------------------------------
 # Uploaders & options (sidebar)
@@ -708,6 +706,7 @@ if run_button and tu_file is not None:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
+
 
 
 
