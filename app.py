@@ -380,6 +380,16 @@ if run_button and tu_file is not None:
             .sort_values(["bin10_minute", "type"])
         )
 
+        # Sélecteur interactif des types d'arrêts à afficher
+        stu_chart_types = st.multiselect(
+        "Types d'arrêts à afficher (courbe passages)",
+        options=sorted(series_passages['type'].unique().tolist()),
+        default=sorted(series_passages['type'].unique().tolist())
+        )
+
+        # Filtrage des données selon sélection
+        series_passages = series_passages[series_passages['type'].isin(stu_chart_types)]
+
         if not series_passages.empty:
             line_passages = (
                 alt.Chart(series_passages)
@@ -572,4 +582,5 @@ if run_button and tu_file is not None:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
+
 
