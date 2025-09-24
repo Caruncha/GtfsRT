@@ -11,7 +11,8 @@ Fonctions :
 - Exporte : summary.md, summary.json, trips.csv, stop_updates.csv, anomalies.csv,
             (optionnel) schedule_compare.csv
 
-Installation locale : pip install pandas gtfs-realtime-bindings tzdata numpy
+Installation locale :
+    pip install pandas gtfs-realtime-bindings tzdata numpy
 """
 
 import argparse
@@ -163,7 +164,7 @@ def load_static_gtfs(path: Optional[str]) -> Dict[str, pd.DataFrame]:
     return {"stops": stops, "trips": trips, "stop_times": stop_times, "routes": routes, "agency": agency}
 
 # --------------------------------------------------------------------------------------
-# Comparaison planifié vs RT (pour schedule_compare)
+# Comparaison planifié vs RT (schedule_compare)
 # --------------------------------------------------------------------------------------
 
 def _default_agency_tz(static_gtfs: Dict[str, pd.DataFrame]) -> str:
@@ -252,15 +253,25 @@ def compute_schedule_deltas(stu_df: pd.DataFrame, static_gtfs: Dict[str, pd.Data
         np.nan
     )
 
-    # Deltas
+    # Plausibilité des timestamps RT avant calcul des deltas (évite écarts monstrueux)
+    comp["arrival_time_clean"] = comp["arrival_time"].where(
+        comp["arrival_time"].apply(lambda v: isinstance(v, (int, float)) and plausible_unix_seconds(v)),
+        np.nan
+    )
+    comp["departure_time_clean"] = comp["departure_time"].where(
+        comp["departure_time"].apply(lambda v: isinstance(v, (int, float)) and plausible_unix_seconds(v)),
+        np.nan
+    )
+
+    # Deltas (utilise *_clean)
     comp["arr_delta_sec"] = comp.apply(
-        lambda r: (r["arrival_time"] - r["arr_sched_epoch"])
-        if pd.notna(r.get("arrival_time")) and pd.notna(r.get("arr_sched_epoch")) else np.nan,
+        lambda r: (r["arrival_time_clean"] - r["arr_sched_epoch"])
+        if pd.notna(r.get("arrival_time_clean")) and pd.notna(r.get("arr_sched_epoch")) else np.nan,
         axis=1
     )
     comp["dep_delta_sec"] = comp.apply(
-        lambda r: (r["departure_time"] - r["dep_sched_epoch"])
-        if pd.notna(r.get("departure_time")) and pd.notna(r.get("dep_sched_epoch")) else np.nan,
+        lambda r: (r["departure_time_clean"] - r["dep_sched_epoch"])
+        if pd.notna(r.get("departure_time_clean")) and pd.notna(r.get("dep_sched_epoch")) else np.nan,
         axis=1
     )
 
@@ -569,7 +580,7 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
     }
 
 # --------------------------------------------------------------------------------------
-# Rendu du rapport (fichiers, **sans HTML**)
+# Rendu du rapport (fichiers, sans HTML)
 # --------------------------------------------------------------------------------------
 
 def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optional[str]):
