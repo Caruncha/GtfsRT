@@ -247,7 +247,6 @@ def _ensure_min_schema(df: pd.DataFrame, required: dict) -> pd.DataFrame:
                 out[col] = pd.Series([], dtype="object")
     return out
 
-
 # ------------------------------
 # Analyse
 # ------------------------------
@@ -274,29 +273,8 @@ if run_button and tu_file is not None:
         except Exception:
             pass
 
-    trips_df = analysis["trips_df"].copy()
-    stu_df   = analysis["stu_df"].copy()
-
-# Garantit le schéma minimal (même si DataFrame vide)
-trips_df = _ensure_min_schema(trips_df, {
-    "trip_key": "string",
-    "route_id": "string",
-    "trip_id":  "string",
-    "start_date": "string",
-    "start_time": "string",
-    "trip_schedule_relationship": "Int64",
-})
-stu_df = _ensure_min_schema(stu_df, {
-    "trip_key": "string",
-    "route_id": "string",
-    "trip_id":  "string",
-    "stop_id":  "string",
-    "stop_sequence": "Int64",
-    "stu_schedule_relationship": "Int64",
-    "arrival_time": "float",
-    "departure_time": "float",
-})
-
+    trips_df = analysis["trips_df"]
+    stu_df = analysis["stu_df"]
     anomalies_df = analysis["anomalies"]
     sched_df = analysis.get("schedule_compare_df", pd.DataFrame())
     schedule_stats = analysis.get("schedule_stats", {})
@@ -331,13 +309,7 @@ stu_df = _ensure_min_schema(stu_df, {
     if trip_id_query:
         trips_view = trips_view[trips_view["trip_id"].fillna("").str.contains(trip_id_query, case=False)]
 
-    merge_cols = [c for c in ["trip_key", "route_id", "trip_id"] if c in trips_df.columns]
-if "trip_key" in stu_df.columns and "trip_key" in merge_cols:
-    stu_view = stu_df.merge(trips_df[merge_cols], on="trip_key", how="left", suffixes=("", "_t"))
-else:
-    # Cas ultra-dégénéré: on n’a pas de clé; on garde stu_df tel quel.
-    stu_view = stu_df.copy()
-
+    stu_view = stu_df.merge(trips_df[["trip_key", "route_id", "trip_id"]], on="trip_key", how="left", suffixes=("", "_t"))
     if route_sel:
         stu_view = stu_view[stu_view["route_id"].isin(route_sel)]
     if trip_id_query:
