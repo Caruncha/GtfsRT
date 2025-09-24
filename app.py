@@ -28,10 +28,9 @@ with st.sidebar:
     gtfs_file = st.file_uploader("GTFS statique (zip) (optionnel)", type=["zip"])
     st.divider()
     st.header("Options d'affichage")
-    # Fuseau horaire pour l'affichage des heures locales (heatmap, etc.)
     default_tz = "America/Toronto"
     tz_input = st.text_input("Fuseau horaire (IANA)", value=default_tz, help="Ex.: America/Toronto, America/Montreal, UTC")
-    st.caption("Astuce : si le fichier est volumineux, augmentez la taille max d’upload via `.streamlit/config.toml` → [server] maxUploadSize = 200")
+    st.caption("Astuce : pour de gros fichiers, augmentez la taille via `.streamlit/config.toml` → [server] maxUploadSize = 200")
     run_button = st.button("Analyser", type="primary")
 
 # ------------------------------
@@ -103,7 +102,6 @@ def _build_html_report(analysis: dict) -> str:
             "schedule_compare_rows": int(len(analysis.get("schedule_compare_df", pd.DataFrame())))
         }
     }
-    # réutilise la structure HTML du module
     from gtfsrt_tripupdates_report import _build_summary_html
     return _build_summary_html({
         "meta": payload["meta"],
@@ -144,34 +142,19 @@ if run_button and tu_file is not None:
 
     # TripDescriptor schedule_relationship
     map_trip = _sr_label_map_trip()
-    trip_types = [
-        (0, "SCHEDULED"),
-        (1, "ADDED"),
-        (2, "UNSCHEDULED"),
-        (3, "CANCELED")
-    ]
+    trip_types = [(0, "SCHEDULED"), (1, "ADDED"), (2, "UNSCHEDULED"), (3, "CANCELED")]
     trip_sel_labels = st.sidebar.multiselect(
-        "Types de voyages",
-        options=[lbl for _, lbl in trip_types],
-        default=[lbl for _, lbl in trip_types]
+        "Types de voyages", options=[lbl for _, lbl in trip_types], default=[lbl for _, lbl in trip_types]
     )
-    trip_sel_vals = {v for k, v in trip_types if v in trip_sel_labels}
-    trip_sel_ids = {k for k, v in trip_types if v in trip_sel_vals}
+    trip_sel_ids = {k for k, v in trip_types if v in set(trip_sel_labels)}
 
     # StopTimeUpdate schedule_relationship
     map_stu = _sr_label_map_stu()
-    stu_types = [
-        (0, "SCHEDULED"),
-        (1, "SKIPPED"),
-        (2, "NO_DATA")
-    ]
+    stu_types = [(0, "SCHEDULED"), (1, "SKIPPED"), (2, "NO_DATA")]
     stu_sel_labels = st.sidebar.multiselect(
-        "Types d'arrêts (STU)",
-        options=[lbl for _, lbl in stu_types],
-        default=[lbl for _, lbl in stu_types]
+        "Types d'arrêts (STU)", options=[lbl for _, lbl in stu_types], default=[lbl for _, lbl in stu_types]
     )
-    stu_sel_vals = {v for k, v in stu_types if v in stu_sel_labels}
-    stu_sel_ids = {k for k, v in stu_types if v in stu_sel_vals}
+    stu_sel_ids = {k for k, v in stu_types if v in set(stu_sel_labels)}
 
     trip_id_query = st.sidebar.text_input("Recherche trip_id (contient)", value="")
 
@@ -201,7 +184,6 @@ if run_button and tu_file is not None:
     added_trips = int((trips_view["trip_schedule_relationship"] == 1).sum())     # ADDED
     unscheduled_trips = int((trips_view["trip_schedule_relationship"] == 2).sum())  # UNSCHEDULED
 
-    # Partial canceled depends on filtered stu_view
     sk = stu_view[stu_view["stu_schedule_relationship"] == 1]  # SKIPPED
     trips_with_sk = set(sk["trip_key"]) if not sk.empty else set()
     fully_canceled = set(trips_view.loc[trips_view["trip_schedule_relationship"] == 3, "trip_key"])
@@ -409,7 +391,6 @@ if run_button and tu_file is not None:
 
     if show_trips_flag:
         st.subheader("Trips")
-        # map type libellé pour lisibilité
         tv = trips_view.copy()
         tv["trip_type"] = tv["trip_schedule_relationship"].map(_sr_label_map_trip()).fillna("SCHEDULED")
         st.dataframe(tv, use_container_width=True)
