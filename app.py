@@ -122,10 +122,18 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
 
 # --- Helpers annulations (10 min) ---
 def _hms_to_seconds(hms: Optional[str]) -> Optional[int]:
+    """Accepte HH:MM ou HH:MM:SS (seconds facultatives)."""
     if hms is None or pd.isna(hms):
         return None
     try:
-        h, m, s = [int(x) for x in str(hms).split(":")]
+        parts = [int(x) for x in str(hms).split(":")]
+        if len(parts) == 3:
+            h, m, s = parts
+        elif len(parts) == 2:
+            h, m = parts
+            s = 0
+        else:
+            return None
         return h * 3600 + m * 60 + s
     except Exception:
         return None
@@ -692,3 +700,4 @@ if run_button and tu_file is not None:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
+
