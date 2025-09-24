@@ -8,9 +8,10 @@ Fonctions :
 - Charge un fichier TripUpdates (Protocol Buffer).
 - (Optionnel) Charge un GTFS statique pour valider la cohérence et comparer au planifié.
 - Produit un rapport : volumes, annulations, qualité des timestamps, incohérences.
-- Exporte : summary.md, summary.json, summary.html, trips.csv, stop_updates.csv, anomalies.csv, (optionnel) schedule_compare.csv
+- Exporte : summary.md, summary.json, summary.html, trips.csv, stop_updates.csv, anomalies.csv,
+            (optionnel) schedule_compare.csv
 
-Installation : pip install pandas gtfs-realtime-bindings
+Installation locale : pip install -r requirements.txt
 """
 
 import argparse
@@ -693,7 +694,7 @@ def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optiona
         if sched_cmp_csv:
             f.write(f"- `schedule_compare.csv` : écart prédiction vs planifié par STU\n")
 
-    # HTML simple
+    # HTML simple autonome
     html_path = os.path.join(out_dir, "summary.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(_build_summary_html(summary_payload))
