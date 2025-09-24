@@ -811,88 +811,94 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
             "non_monotonic_times_trips": None,
         }
 
-    # ---------------------- Post-traitements demandés ----------------------
-    # 1) start_time = heure du premier arrêt (HH:MM, locale par trip)
-    if not trips_df.empty:
-        tz_map = _trip_timezone_map(static_gtfs)
-        tz_default = _default_agency_tz(static_gtfs)
-        start_hhmm_by_tkey = {}
+# ---------------------- Post-traitements demandés ----------------------
+    # Objectifs:
+    #  - start_time (trips) = heure planifiée du 1er arrêt (stop_times.txt), HH:MM
+    #  - trip_key (trips & stu) = trip_id (sans start_time / start_date)
+    #  - conserver direction_id / direction_label si dispo
 
+    if not trips_df.empty:
+        # Sauvegarde des anciennes clés pour re-mapper les STU
+        trips_df["__old_trip_key"] = trips_df["trip_key"]
+
+        # --- Fallback 1 (si pas de GTFS statique) : dérive HH:MM depuis les STU (event_time min) ---
+        stu_hhmm_by_oldkey = {}
         if not stu_df.empty:
             st = stu_df.copy()
-            st["stop_sequence"] = pd.to_numeric(st.get("stop_sequence"), errors="coerce")
             st["event_time"] = st["departure_time"].where(st["departure_time"].notna(), st["arrival_time"])
+            st["event_time"] = pd.to_numeric(st["event_time"], errors="coerce")
+            # Heures locales via tz par trip_id (si connu), sinon tz par défaut
+            tz_map = _trip_timezone_map(static_gtfs)
+            tz_default = _default_agency_tz(static_gtfs)
 
             for tkey_val, g in st.groupby("trip_key"):
-                g_valid = g.dropna(subset=["stop_sequence"])
-                cand = g_valid if not g_valid.empty else g
-                if not g_valid.empty:
-                    min_seq = g_valid["stop_sequence"].min()
-                    cand = g_valid[g_valid["stop_sequence"] == min_seq]
-                et = pd.to_numeric(cand["event_time"], errors="coerce").dropna()
+                et = g["event_time"].dropna()
                 if et.empty:
-                    et = pd.to_numeric(g["event_time"], errors="coerce").dropna()
-                if not et.empty:
-                    epoch = int(np.nanmin(et))
-                    # tz par trip_id
-                    try:
-                        tid = trips_df.loc[trips_df["trip_key"] == tkey_val, "trip_id"].iloc[0]
-                    except Exception:
-                        tid = None
-                    tz_used = tz_map.get(str(tid), tz_default) if (tid not in (None, "", np.nan)) else tz_default
-                    try:
-                        hhmm = datetime.fromtimestamp(epoch, tz=ZoneInfo(tz_used)).strftime("%H:%M")
-                    except Exception:
-                        hhmm = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%H:%M")
-                    start_hhmm_by_tkey[tkey_val] = hhmm
+                    continue
+                epoch = int(np.nanmin(et))
+                # trip_id courant (via trips_df)
+                try:
+                    tid = trips_df.loc[trips_df["__old_trip_key"] == tkey_val, "trip_id"].iloc[0]
+                except Exception:
+                    tid = None
+                tz_used = tz_map.get(str(tid), tz_default) if (tid not in (None, "", np.nan)) else tz_default
+                try:
+                    hhmm = datetime.fromtimestamp(epoch, tz=ZoneInfo(tz_used)).strftime("%H:%M")
+                except Exception:
+                    hhmm = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%H:%M")
+                stu_hhmm_by_oldkey[tkey_val] = hhmm
 
-        # applique (fallback: tronque TripDescriptor.start_time → HH:MM si pas de STU)
+        # Pré-remplit start_time via STU (si dispo), sinon tronque TripDescriptor.start_time
         trips_df["start_time"] = trips_df.apply(
-            lambda r: start_hhmm_by_tkey.get(
-                r["trip_key"],
+            lambda r: stu_hhmm_by_oldkey.get(
+                r["__old_trip_key"],
                 (str(r.get("start_time", ""))[:5] if isinstance(r.get("start_time", ""), str) and len(str(r.get("start_time", ""))) >= 5 else "")
             ),
             axis=1
         ).astype(str)
 
-        # 2) trip_key SANS start_date → "trip_id \n start_time"
-        trips_df["__old_trip_key"] = trips_df["trip_key"]
+        # --- Source officielle (prioritaire) : GTFS statique stop_times.txt (1er arrêt) ---
+        st_static = static_gtfs.get("stop_times", pd.DataFrame())
+        if not st_static.empty and {"trip_id", "stop_sequence", "arrival_time", "departure_time"}.issubset(st_static.columns):
+            st_first = (
+                st_static
+                .sort_values("stop_sequence", kind="mergesort")  # stable
+                .groupby("trip_id", as_index=False)
+                .first()[["trip_id", "arrival_time", "departure_time"]]
+            )
 
-        def _new_key(row):
-            tid = str(row.get("trip_id", "") or "")
-            st_short = str(row.get("start_time", "") or "")
-            if tid or st_short:
-                return f"{tid}\n{st_short}"
-            return row["__old_trip_key"]
+            def _pick_hhmm(row):
+                # priorité au depart, sinon arrival ; format HH:MM
+                hms = row["departure_time"] if pd.notna(row["departure_time"]) and row["departure_time"] != "" else row["arrival_time"]
+                hms = "" if pd.isna(hms) else str(hms)
+                return hms[:5] if len(hms) >= 5 else ""
 
-        trips_df["trip_key"] = trips_df.apply(_new_key, axis=1)
+            st_first["start_hhmm_static"] = st_first.apply(_pick_hhmm, axis=1)
+            map_static = dict(zip(st_first["trip_id"].astype(str), st_first["start_hhmm_static"].astype(str)))
+            # Override avec le planifié quand présent
+            trips_df["start_time"] = trips_df.apply(
+                lambda r: (map_static.get(str(r.get("trip_id", ""))) or r["start_time"]),
+                axis=1
+            ).astype(str)
 
+        # --- trip_key = trip_id (sans heure / sans date) ---
+        trips_df["trip_key"] = trips_df["trip_id"].astype(str)
+
+        # Re-map des clés dans stu_df pour garder la cohérence avec l'app
         if not stu_df.empty and "trip_key" in stu_df.columns:
             key_map = dict(zip(trips_df["__old_trip_key"], trips_df["trip_key"]))
             stu_df["trip_key"] = stu_df["trip_key"].map(lambda k: key_map.get(k, k))
+
         trips_df.drop(columns=["__old_trip_key"], inplace=True)
 
-        # 3) Ajout de la direction (0/1) + label Ouest/Sud vs Est/Nord à partir du GTFS statique
+        # --- Direction depuis trips.txt si dispo ---
         static_trips = static_gtfs.get("trips", pd.DataFrame())
-        if not static_trips.empty and "trip_id" in static_trips.columns and "direction_id" in static_trips.columns:
+        if not static_trips.empty and {"trip_id", "direction_id"}.issubset(static_trips.columns):
             dir_df = static_trips[["trip_id", "direction_id"]].copy()
             dir_df["direction_id"] = pd.to_numeric(dir_df["direction_id"], errors="coerce").astype("Int64")
             trips_df = trips_df.merge(dir_df, on="trip_id", how="left")
             trips_df["direction_label"] = trips_df["direction_id"].map({1: "Ouest/Sud", 0: "Est/Nord"}).astype("string")
 
-    return {
-        "meta": meta,
-        "summary": summary,
-        "ts_quality": ts_quality,
-        "trips_df": trips_df,
-        "stu_df": stu_df,
-        "anomalies": pd.DataFrame(anomalies),
-        "schedule_compare_df": schedule_compare_df,
-        "schedule_stats": schedule_stats,
-        "static_meta": {
-            "default_timezone": _default_agency_tz(static_gtfs) if static_gtfs else "UTC"
-        }
-    }
 
 
 # ----------------------- Rendu rapport (fichiers) -----------------------------
@@ -1089,3 +1095,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
