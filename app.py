@@ -13,7 +13,6 @@ import numpy as np
 from gtfsrt_tripupdates_report import (
     analyze_tripupdates,
     load_static_gtfs,
-    build_graphical_report_html,  # export HTML graphique
 )
 
 # Désactive la limite par défaut d'Altair (évite MaxRowsError dans l'app)
@@ -24,7 +23,7 @@ st.set_page_config(page_title="🚌 Analyseur TripUpdates", layout="wide")
 st.title("🚌 Analyseur GTFS‑realtime : TripUpdates")
 st.write(
     "Charge un fichier **TripUpdates (Protocol Buffer)** (extension libre) et, optionnellement, un **GTFS statique** pour des validations avancées et la comparaison au planifié. "
-    "Utilise les filtres pour explorer, et télécharge les résultats et rapports."
+    "Utilise les filtres pour explorer, et télécharge les résultats."
 )
 
 # ------------------------------
@@ -222,28 +221,6 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
     # Ordonne correctement l'axe X par la valeur numérique
     out = out.sort_values(["bin10_minute", "kind"])
     return out[["bin10_minute", "bin10_label", "kind", "compte"]]
-
-def _build_html_report(analysis: dict) -> str:
-    """Construit un HTML autonome (texte + tableaux) téléchargeable."""
-    payload = {
-        "meta": analysis["meta"],
-        "summary": analysis["summary"],
-        "timestamp_quality": analysis["ts_quality"],
-        "schedule_compare": analysis.get("schedule_stats", {}),
-        "counts": {
-            "trip_rows": int(len(analysis["trips_df"])),
-            "stop_time_updates": int(len(analysis["stu_df"])),
-            "anomalies": int(len(analysis["anomalies"])),
-            "schedule_compare_rows": int(len(analysis.get("schedule_compare_df", pd.DataFrame())))
-        }
-    }
-    from gtfsrt_tripupdates_report import _build_summary_html
-    return _build_summary_html({
-        "meta": payload["meta"],
-        "summary": payload["summary"],
-        "timestamp_quality": payload["timestamp_quality"],
-        "schedule_compare": payload["schedule_compare"]
-    })
 
 # ------------------------------
 # Analyse
@@ -544,7 +521,7 @@ if run_button and tu_file is not None:
 
     # ------------------ Téléchargements ------------------
     st.markdown("### Téléchargements")
-    cdl1, cdl2, cdl3, cdl4, cdl5, cdl6 = st.columns(6)
+    cdl1, cdl2, cdl3, cdl4 = st.columns(4)
     with cdl1:
         st.download_button("⬇️ trips.csv", _to_csv_bytes(trips_df), "trips.csv", mime="text/csv")
     with cdl2:
@@ -567,12 +544,6 @@ if run_button and tu_file is not None:
         st.download_button("⬇️ summary.json",
                            json.dumps(summary_payload, ensure_ascii=False, indent=2).encode("utf-8"),
                            "summary.json", mime="application/json")
-    with cdl5:
-        html_bytes = _build_html_report(analysis).encode("utf-8")
-        st.download_button("⬇️ summary.html", html_bytes, "summary.html", mime="text/html")
-    with cdl6:
-        html_graphs = build_graphical_report_html(analysis, tz_str=tz_input).encode("utf-8")
-        st.download_button("⬇️ rapport_graphique.html", html_graphs, "rapport_graphique.html", mime="text/html")
 
     # ------------------ Tables ------------------
     st.markdown("### Tables")
