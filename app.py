@@ -8,12 +8,16 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 import altair as alt
+import numpy as np
 
 from gtfsrt_tripupdates_report import (
     analyze_tripupdates,
     load_static_gtfs,
     build_graphical_report_html,  # export HTML graphique
 )
+
+# Désactive la limite par défaut d'Altair (évite MaxRowsError dans l'app)
+alt.data_transformers.enable('default', max_rows=None)
 
 st.set_page_config(page_title="🚌 Analyseur TripUpdates", layout="wide")
 
@@ -30,7 +34,7 @@ with st.sidebar:
     st.header("Fichiers")
     tu_file = st.file_uploader(
         "Fichier TripUpdates (Protocol Buffer GTFS‑rt – extension quelconque)",
-        type=None  # <= accepte tout
+        type=None  # accepte tout
     )
     gtfs_file = st.file_uploader("GTFS statique (zip) (optionnel)", type=["zip"])
     st.divider()
@@ -99,12 +103,12 @@ def _event_epoch_series(stu_df: pd.DataFrame) -> pd.Series:
 
 def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     """
-    Ajoute deux colonnes :
-      - bin10_minute : minute depuis minuit locale arrondie à 10 min (0..1430) [dtype: Int64]
-      - bin10_label  : libellé 'HH:MM' de la tranche (08:30, 08:40, …) [dtype: string]
+    Ajoute :
+      - bin10_minute (Int64) : minute depuis minuit locale arrondie à 10 min (0..1430)
+      - bin10_label  (string): libellé 'HH:MM' de la tranche
     Priorise departure_time, sinon arrival_time pour l'événement temporel.
     """
-    s = _event_epoch_series(df)  # timestamps epoch (secondes), NaN possible
+    s = _event_epoch_series(df)
     out = df.copy()
 
     if s.empty:
@@ -112,22 +116,15 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
         out["bin10_label"] = pd.Series([pd.NA] * len(out), dtype="string")
         return out
 
-    # UTC → fuseau local (IANA)
     try:
         dt_local = pd.to_datetime(s, unit="s", utc=True).dt.tz_convert(ZoneInfo(tz_str))
     except Exception:
         dt_local = pd.to_datetime(s, unit="s", utc=True)
 
-    # Arrondi à la tranche 10 min
-    dt10 = dt_local.dt.floor("10min")  # NaT reste NaT
-
-    # minute depuis minuit locale (nullable)
+    dt10 = dt_local.dt.floor("10min")
     minute_of_day = dt10.dt.hour * 60 + dt10.dt.minute
     out["bin10_minute"] = pd.to_numeric(minute_of_day, errors="coerce").astype("Int64")
-
-    # Libellé de tranche (HH:MM) — string nullable
     out["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
-
     return out
 
 # --- Helpers pour binning des voyages (annulations) ---
@@ -152,11 +149,11 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
                                      stu_view: pd.DataFrame,
                                      tz_str: str) -> pd.DataFrame:
     """
-    Retourne un DataFrame avec colonnes:
+    Retourne colonnes:
       - bin10_minute (Int64), bin10_label (string)
       - kind in {"Annulations complètes", "Annulations partielles"}
       - compte
-    Binning à 10 min basé sur :
+    Binning 10 min basé sur :
       - min(event_time) par trip (dep/arr STU), sinon
       - start_date + start_time (si présents)
     """
@@ -273,6 +270,7 @@ if run_button and tu_file is not None:
             tz_input = tz_detected
         except Exception:
             pass
+
     trips_df = analysis["trips_df"]
     stu_df = analysis["stu_df"]
     anomalies_df = analysis["anomalies"]
@@ -311,8 +309,7 @@ if run_button and tu_file is not None:
     if trip_sel_ids:
         trips_view = trips_view[trips_view["trip_schedule_relationship"].isin(trip_sel_ids)]
     if trip_id_query:
-        trips_view = trips_view[trips_view["trip_id"].fillna("").str.Contains(trip_id_query, case=False)] if False else \
-                     trips_view[trips_view["trip_id"].fillna("").str.contains(trip_id_query, case=False)]
+        trips_view = trips_view[trips_view["trip_id"].fillna("").str.contains(trip_id_query, case=False)]
 
     # Pour filtrer les STU selon route/trip
     stu_view = stu_df.merge(
@@ -448,10 +445,10 @@ if run_button and tu_file is not None:
 
     # ------------------ Top 20 arrêts annulés ------------------
     st.markdown("### Top 20 des arrêts annulés (SKIPPED)")
-    sk = stu_view[stu_view["stu_schedule_relationship"] == 1]
-    if not sk.empty:
+    sk_only = stu_view[stu_view["stu_schedule_relationship"] == 1]
+    if not sk_only.empty:
         top_sk = (
-            sk.groupby("stop_id")
+            sk_only.groupby("stop_id")
             .size().reset_index(name="compte")
             .sort_values("compte", ascending=False)
             .head(20)
@@ -486,7 +483,7 @@ if run_button and tu_file is not None:
         c3.metric("Departure — médiane (s)", f"{dep.get('median_signed_sec', 0):.0f}")
         c4.metric("≤ 5 min (arrival)", f"{arr.get('within_5_min_pct', 0):.1f}%")
 
-        # Histogrammes des deltas (en minutes)
+        # Histogrammes pré-agrégés (60 bacs) pour éviter MaxRowsError
         sched_plot = sched_df.copy()
         sched_plot["arr_delta_min"] = pd.to_numeric(sched_plot["arr_delta_sec"], errors="coerce") / 60.0
         sched_plot["dep_delta_min"] = pd.to_numeric(sched_plot["dep_delta_sec"], errors="coerce") / 60.0
@@ -495,11 +492,16 @@ if run_button and tu_file is not None:
         with charts[0]:
             s = sched_plot["arr_delta_min"].dropna()
             if not s.empty:
+                counts, edges = np.histogram(s, bins=60)
+                centers = (edges[:-1] + edges[1:]) / 2.0
+                df_arr_hist = pd.DataFrame({"bin_center": centers, "count": counts})
                 chart_arr = (
-                    alt.Chart(pd.DataFrame({"delta_min": s}))
+                    alt.Chart(df_arr_hist)
                     .mark_bar()
-                    .encode(x=alt.X("delta_min:Q", bin=alt.Bin(maxbins=60), title="Écart (minutes, +retard / -avance)"),
-                            y=alt.Y("count():Q", title="Nombre"))
+                    .encode(
+                        x=alt.X("bin_center:Q", title="Écart (minutes, +retard / -avance)"),
+                        y=alt.Y("count:Q", title="Nombre")
+                    )
                     .properties(height=300)
                 )
                 st.altair_chart(chart_arr, use_container_width=True)
@@ -508,11 +510,16 @@ if run_button and tu_file is not None:
         with charts[1]:
             s = sched_plot["dep_delta_min"].dropna()
             if not s.empty:
+                counts, edges = np.histogram(s, bins=60)
+                centers = (edges[:-1] + edges[1:]) / 2.0
+                df_dep_hist = pd.DataFrame({"bin_center": centers, "count": counts})
                 chart_dep = (
-                    alt.Chart(pd.DataFrame({"delta_min": s}))
+                    alt.Chart(df_dep_hist)
                     .mark_bar()
-                    .encode(x=alt.X("delta_min:Q", bin=alt.Bin(maxbins=60), title="Écart (minutes)"),
-                            y=alt.Y("count():Q", title="Nombre"))
+                    .encode(
+                        x=alt.X("bin_center:Q", title="Écart (minutes)"),
+                        y=alt.Y("count:Q", title="Nombre")
+                    )
                     .properties(height=300)
                 )
                 st.altair_chart(chart_dep, use_container_width=True)
