@@ -9,14 +9,18 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-from gtfsrt_tripupdates_report import analyze_tripupdates, load_static_gtfs
+from gtfsrt_tripupdates_report import (
+    analyze_tripupdates,
+    load_static_gtfs,
+    build_graphical_report_html,  # export HTML graphique
+)
 
 st.set_page_config(page_title="🚌 Analyseur TripUpdates", layout="wide")
 
 st.title("🚌 Analyseur GTFS‑realtime : TripUpdates")
 st.write(
-    "Charge un fichier **TripUpdates .pb** (Protocol Buffer) et, optionnellement, un **GTFS statique** pour des validations avancées et la comparaison au planifié. "
-    "Utilise les filtres pour explorer, et télécharge les résultats."
+    "Charge un fichier **TripUpdates (Protocol Buffer)** (extension libre) et, optionnellement, un **GTFS statique** pour des validations avancées et la comparaison au planifié. "
+    "Utilise les filtres pour explorer, et télécharge les résultats et rapports."
 )
 
 # ------------------------------
@@ -24,7 +28,10 @@ st.write(
 # ------------------------------
 with st.sidebar:
     st.header("Fichiers")
-    tu_file = st.file_uploader("Fichier TripUpdates (.pb)", type=["pb", "bin"])
+    tu_file = st.file_uploader(
+        "Fichier TripUpdates (Protocol Buffer GTFS‑rt – extension quelconque)",
+        type=None  # <= accepte tout
+    )
     gtfs_file = st.file_uploader("GTFS statique (zip) (optionnel)", type=["zip"])
     st.divider()
     st.header("Options d'affichage")
@@ -43,7 +50,7 @@ def run_analysis_cached(tu_bytes: bytes, gtfs_bytes: bytes | None):
     ne pas recalculer à chaque rechargement de l'app.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        tu_path = os.path.join(tmpdir, "tripupdates.pb")
+        tu_path = os.path.join(tmpdir, "tripupdates.any")  # extension libre
         with open(tu_path, "wb") as f:
             f.write(tu_bytes)
 
@@ -90,28 +97,10 @@ def _event_epoch_series(stu_df: pd.DataFrame) -> pd.Series:
     t = stu_df["departure_time"].where(stu_df["departure_time"].notna(), stu_df["arrival_time"])
     return pd.to_numeric(t, errors="coerce")
 
-def _add_local_hour(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
-    """
-    Ajoute 'hour_local' (0..23) selon le fuseau local.
-    (Conservée si tu veux une vue par heure ; non utilisée pour les courbes 10 min.)
-    """
-    s = _event_epoch_series(df)
-    if s.empty:
-        df = df.copy()
-        df["hour_local"] = pd.NA
-        return df
-    try:
-        dt = pd.to_datetime(s, unit="s", utc=True).dt.tz_convert(ZoneInfo(tz_str))
-    except Exception:
-        dt = pd.to_datetime(s, unit="s", utc=True)  # fallback UTC
-    out = df.copy()
-    out["hour_local"] = dt.dt.hour
-    return out
-
 def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     """
     Ajoute deux colonnes :
-      - bin10_minute : minute depuis minuit locale arrondie à 10 min (0, 10, 20, …, 1430) [dtype: Int64]
+      - bin10_minute : minute depuis minuit locale arrondie à 10 min (0..1430) [dtype: Int64]
       - bin10_label  : libellé 'HH:MM' de la tranche (08:30, 08:40, …) [dtype: string]
     Priorise departure_time, sinon arrival_time pour l'événement temporel.
     """
@@ -129,7 +118,7 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     except Exception:
         dt_local = pd.to_datetime(s, unit="s", utc=True)
 
-    # Arrondit à la tranche 10 min
+    # Arrondi à la tranche 10 min
     dt10 = dt_local.dt.floor("10min")  # NaT reste NaT
 
     # minute depuis minuit locale (nullable)
@@ -192,18 +181,13 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
     # 2) Fallback : start_date + start_time
     missing_event = tv["trip_event_epoch"].isna()
     if "start_date" in tv.columns and "start_time" in tv.columns:
-        # epoch = minuit local + start_time(sec)
         midnight_epoch = tv.loc[missing_event, "start_date"].apply(
             lambda sd: _service_midnight_epoch(sd, tz_str) if isinstance(sd, str) and len(sd) == 8 else None
         )
         start_sec = tv.loc[missing_event, "start_time"].apply(_hms_to_seconds)
-        # calcul sécurisé
         fallback_epoch = []
         for me, ss in zip(midnight_epoch.tolist(), start_sec.tolist()):
-            if me is None or ss is None:
-                fallback_epoch.append(None)
-            else:
-                fallback_epoch.append(me + ss)
+            fallback_epoch.append(None if me is None or ss is None else me + ss)
         tv.loc[missing_event, "trip_event_epoch"] = pd.to_numeric(pd.Series(fallback_epoch), errors="coerce")
 
     # 3) Conversion epoch → local, bin 10 min
@@ -211,7 +195,6 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
     try:
         dt_local = dt_local.dt.tz_convert(ZoneInfo(tz_str))
     except Exception:
-        # Si le fuseau est invalide, on reste en UTC
         pass
     dt10 = dt_local.dt.floor("10min")
 
@@ -219,8 +202,6 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
     tv["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
 
     # 4) Détermination des types d'annulation
-    #   - complètes : trip_schedule_relationship == 3
-    #   - partielles : trip_key ∈ (trips avec SKIPPED) \ (complètement annulés)
     fully_canceled_keys = set(tv.loc[tv["trip_schedule_relationship"] == 3, "trip_key"])
     if not stu_view.empty:
         skipped_keys = set(stu_view.loc[stu_view["stu_schedule_relationship"] == 1, "trip_key"])
@@ -243,7 +224,6 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
 
     # Ordonne correctement l'axe X par la valeur numérique
     out = out.sort_values(["bin10_minute", "kind"])
-    # Colonnes dans l'ordre
     return out[["bin10_minute", "bin10_label", "kind", "compte"]]
 
 def _build_html_report(analysis: dict) -> str:
@@ -260,7 +240,6 @@ def _build_html_report(analysis: dict) -> str:
             "schedule_compare_rows": int(len(analysis.get("schedule_compare_df", pd.DataFrame())))
         }
     }
-    # On réutilise la fabrique HTML du module pour rester cohérents
     from gtfsrt_tripupdates_report import _build_summary_html
     return _build_summary_html({
         "meta": payload["meta"],
@@ -273,10 +252,19 @@ def _build_html_report(analysis: dict) -> str:
 # Analyse
 # ------------------------------
 if run_button and tu_file is not None:
-    with st.spinner("Analyse en cours…"):
-        analysis, static_gtfs = run_analysis_cached(tu_file.getvalue(), gtfs_file.getvalue() if gtfs_file else None)
+    try:
+        with st.spinner("Analyse en cours…"):
+            analysis, static_gtfs = run_analysis_cached(
+                tu_file.getvalue(),
+                gtfs_file.getvalue() if gtfs_file else None
+            )
+    except Exception as e:
+        st.error("❌ Le fichier fourni ne semble pas être un **GTFS‑rt TripUpdates** valide (Protocol Buffer).")
+        st.caption(f"Détail technique : {e.__class__.__name__}")
+        st.stop()
 
     st.success("Analyse terminée ✅")
+    st.write(f"Fichier chargé : **{tu_file.name}**")
 
     # Détecte tz par défaut à partir du GTFS s'il existe
     if static_gtfs and not static_gtfs.get("agency", pd.DataFrame()).empty:
@@ -285,7 +273,6 @@ if run_button and tu_file is not None:
             tz_input = tz_detected
         except Exception:
             pass
-
     trips_df = analysis["trips_df"]
     stu_df = analysis["stu_df"]
     anomalies_df = analysis["anomalies"]
@@ -324,7 +311,8 @@ if run_button and tu_file is not None:
     if trip_sel_ids:
         trips_view = trips_view[trips_view["trip_schedule_relationship"].isin(trip_sel_ids)]
     if trip_id_query:
-        trips_view = trips_view[trips_view["trip_id"].fillna("").str.contains(trip_id_query, case=False)]
+        trips_view = trips_view[trips_view["trip_id"].fillna("").str.Contains(trip_id_query, case=False)] if False else \
+                     trips_view[trips_view["trip_id"].fillna("").str.contains(trip_id_query, case=False)]
 
     # Pour filtrer les STU selon route/trip
     stu_view = stu_df.merge(
@@ -460,6 +448,7 @@ if run_button and tu_file is not None:
 
     # ------------------ Top 20 arrêts annulés ------------------
     st.markdown("### Top 20 des arrêts annulés (SKIPPED)")
+    sk = stu_view[stu_view["stu_schedule_relationship"] == 1]
     if not sk.empty:
         top_sk = (
             sk.groupby("stop_id")
@@ -467,7 +456,7 @@ if run_button and tu_file is not None:
             .sort_values("compte", ascending=False)
             .head(20)
         )
-        # Ajoute stop_name si disponible
+        # stop_name si dispo dans le GTFS statique
         stops_static = static_gtfs.get("stops", pd.DataFrame())
         if not stops_static.empty and "stop_name" in stops_static.columns:
             top_sk = top_sk.merge(stops_static[["stop_id", "stop_name"]], on="stop_id", how="left")
@@ -548,7 +537,7 @@ if run_button and tu_file is not None:
 
     # ------------------ Téléchargements ------------------
     st.markdown("### Téléchargements")
-    cdl1, cdl2, cdl3, cdl4, cdl5 = st.columns(5)
+    cdl1, cdl2, cdl3, cdl4, cdl5, cdl6 = st.columns(6)
     with cdl1:
         st.download_button("⬇️ trips.csv", _to_csv_bytes(trips_df), "trips.csv", mime="text/csv")
     with cdl2:
@@ -574,6 +563,9 @@ if run_button and tu_file is not None:
     with cdl5:
         html_bytes = _build_html_report(analysis).encode("utf-8")
         st.download_button("⬇️ summary.html", html_bytes, "summary.html", mime="text/html")
+    with cdl6:
+        html_graphs = build_graphical_report_html(analysis, tz_str=tz_input).encode("utf-8")
+        st.download_button("⬇️ rapport_graphique.html", html_graphs, "rapport_graphique.html", mime="text/html")
 
     # ------------------ Tables ------------------
     st.markdown("### Tables")
@@ -600,4 +592,4 @@ if run_button and tu_file is not None:
         st.dataframe(anomalies_df, use_container_width=True)
 
 else:
-    st.info("Charge au moins un fichier **TripUpdates .pb** puis clique **Analyser** dans la barre latérale.")
+    st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
