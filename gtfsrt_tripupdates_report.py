@@ -50,7 +50,7 @@ def unix_to_iso(ts: Optional[int]) -> Optional[str]:
     if ts is None or pd.isna(ts):
         return None
     try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(int(ts), tz=ZoneInfo('America/Montreal')).isoformat()
     except Exception:
         return None
 
