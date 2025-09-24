@@ -41,6 +41,12 @@ with st.sidebar:
     st.header("Options")
     st.caption("Astuce : pour de gros fichiers, augmentez la taille via `.streamlit/config.toml` → [server] maxUploadSize = 200")
     run_button = st.button("Analyser", type="primary")
+    
+with st.sidebar:
+    # ...
+    if st.button("♻️ Réinitialiser le cache"):
+        st.cache_data.clear()
+        st.experimental_rerun()
 
 # -----------------------------------------------------------------------------
 # Cache d'analyse
@@ -700,4 +706,5 @@ if run_button and tu_file is not None:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
+
 
