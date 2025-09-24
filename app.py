@@ -93,7 +93,7 @@ def _event_epoch_series(stu_df: pd.DataFrame) -> pd.Series:
 def _add_local_hour(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     """
     Ajoute 'hour_local' (0..23) selon le fuseau local.
-    (Conservée si tu veux une vue par heure ; non utilisée pour la heatmap 10 min.)
+    (Conservée si tu veux une vue par heure ; non utilisée pour les courbes 10 min.)
     """
     s = _event_epoch_series(df)
     if s.empty:
@@ -119,7 +119,6 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     out = df.copy()
 
     if s.empty:
-        # Crée des colonnes vides avec dtypes “nullable”
         out["bin10_minute"] = pd.Series([pd.NA] * len(out), dtype="Int64")
         out["bin10_label"] = pd.Series([pd.NA] * len(out), dtype="string")
         return out
@@ -128,10 +127,9 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     try:
         dt_local = pd.to_datetime(s, unit="s", utc=True).dt.tz_convert(ZoneInfo(tz_str))
     except Exception:
-        # fallback : reste en UTC si tz invalide
         dt_local = pd.to_datetime(s, unit="s", utc=True)
 
-    # Arrondit à la tranche 10 min (gère directement NaT)
+    # Arrondit à la tranche 10 min
     dt10 = dt_local.dt.floor("10min")  # NaT reste NaT
 
     # minute depuis minuit locale (nullable)
@@ -142,6 +140,111 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     out["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
 
     return out
+
+# --- Helpers pour binning des voyages (annulations) ---
+def _hms_to_seconds(hms: str) -> int | None:
+    if hms is None or pd.isna(hms):
+        return None
+    try:
+        h, m, s = [int(x) for x in str(hms).split(":")]
+        return h * 3600 + m * 60 + s
+    except Exception:
+        return None
+
+def _service_midnight_epoch(start_date: str, tz_str: str) -> int | None:
+    """start_date (YYYYMMDD) → epoch UTC de minuit local."""
+    try:
+        y, m, d = int(start_date[0:4]), int(start_date[4:6]), int(start_date[6:8])
+        return int(pd.Timestamp(y, m, d, 0, 0, 0, tz=ZoneInfo(tz_str)).timestamp())
+    except Exception:
+        return None
+
+def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
+                                     stu_view: pd.DataFrame,
+                                     tz_str: str) -> pd.DataFrame:
+    """
+    Retourne un DataFrame avec colonnes:
+      - bin10_minute (Int64), bin10_label (string)
+      - kind in {"Annulations complètes", "Annulations partielles"}
+      - compte
+    Binning à 10 min basé sur :
+      - min(event_time) par trip (dep/arr STU), sinon
+      - start_date + start_time (si présents)
+    """
+    if trips_view.empty:
+        return pd.DataFrame(columns=["bin10_minute", "bin10_label", "kind", "compte"])
+
+    # 1) Timestamps d'événement au niveau trip (min des STU par trip_key)
+    if not stu_view.empty:
+        sv = stu_view.copy()
+        sv["event_time"] = sv["departure_time"].where(sv["departure_time"].notna(), sv["arrival_time"])
+        per_trip_event = (
+            sv.dropna(subset=["event_time"])
+              .groupby("trip_key")["event_time"]
+              .min()
+              .rename("trip_event_epoch")
+        )
+    else:
+        per_trip_event = pd.Series(dtype="float", name="trip_event_epoch")
+
+    tv = trips_view.copy().merge(per_trip_event, left_on="trip_key", right_index=True, how="left")
+
+    # 2) Fallback : start_date + start_time
+    missing_event = tv["trip_event_epoch"].isna()
+    if "start_date" in tv.columns and "start_time" in tv.columns:
+        # epoch = minuit local + start_time(sec)
+        midnight_epoch = tv.loc[missing_event, "start_date"].apply(
+            lambda sd: _service_midnight_epoch(sd, tz_str) if isinstance(sd, str) and len(sd) == 8 else None
+        )
+        start_sec = tv.loc[missing_event, "start_time"].apply(_hms_to_seconds)
+        # calcul sécurisé
+        fallback_epoch = []
+        for me, ss in zip(midnight_epoch.tolist(), start_sec.tolist()):
+            if me is None or ss is None:
+                fallback_epoch.append(None)
+            else:
+                fallback_epoch.append(me + ss)
+        tv.loc[missing_event, "trip_event_epoch"] = pd.to_numeric(pd.Series(fallback_epoch), errors="coerce")
+
+    # 3) Conversion epoch → local, bin 10 min
+    dt_local = pd.to_datetime(tv["trip_event_epoch"], unit="s", utc=True, errors="coerce")
+    try:
+        dt_local = dt_local.dt.tz_convert(ZoneInfo(tz_str))
+    except Exception:
+        # Si le fuseau est invalide, on reste en UTC
+        pass
+    dt10 = dt_local.dt.floor("10min")
+
+    tv["bin10_minute"] = pd.to_numeric(dt10.dt.hour * 60 + dt10.dt.minute, errors="coerce").astype("Int64")
+    tv["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
+
+    # 4) Détermination des types d'annulation
+    #   - complètes : trip_schedule_relationship == 3
+    #   - partielles : trip_key ∈ (trips avec SKIPPED) \ (complètement annulés)
+    fully_canceled_keys = set(tv.loc[tv["trip_schedule_relationship"] == 3, "trip_key"])
+    if not stu_view.empty:
+        skipped_keys = set(stu_view.loc[stu_view["stu_schedule_relationship"] == 1, "trip_key"])
+    else:
+        skipped_keys = set()
+    partial_keys = skipped_keys - fully_canceled_keys
+
+    # 5) Agrégation par 10 min
+    tv_non_na = tv.dropna(subset=["bin10_minute"])
+    series_full = tv_non_na.loc[tv_non_na["trip_key"].isin(fully_canceled_keys)] \
+                           .groupby(["bin10_minute", "bin10_label"]).size().rename("compte")
+    series_part = tv_non_na.loc[tv_non_na["trip_key"].isin(partial_keys)] \
+                           .groupby(["bin10_minute", "bin10_label"]).size().rename("compte")
+
+    # 6) Mise en forme longue
+    df_full = series_full.reset_index(); df_full["kind"] = "Annulations complètes"
+    df_part = series_part.reset_index(); df_part["kind"] = "Annulations partielles"
+    out = pd.concat([df_full, df_part], ignore_index=True, sort=False) if not df_full.empty or not df_part.empty \
+          else pd.DataFrame(columns=["bin10_minute", "bin10_label", "compte", "kind"])
+
+    # Ordonne correctement l'axe X par la valeur numérique
+    out = out.sort_values(["bin10_minute", "kind"])
+    # Colonnes dans l'ordre
+    return out[["bin10_minute", "bin10_label", "kind", "compte"]]
 
 def _build_html_report(analysis: dict) -> str:
     """Construit un HTML autonome (texte + tableaux) téléchargeable."""
@@ -296,6 +399,65 @@ if run_button and tu_file is not None:
         else:
             st.info("Aucun StopTimeUpdate après filtres.")
 
+    # ------------------ Courbe des passages (10 min) ------------------
+    st.markdown("### Courbe — Passages par tranches de 10 minutes (par type d'arrêt)")
+    if not stu_view.empty:
+        try:
+            stu_10 = _add_local_bin10(stu_view, tz_input)
+        except Exception:
+            stu_10 = _add_local_bin10(stu_view, "UTC")
+
+        series_passages = (
+            stu_10
+            .assign(type=lambda d: d["stu_schedule_relationship"].map(_sr_label_map_stu()).fillna("AUTRE"))
+            .dropna(subset=["bin10_minute"])
+            .groupby(["bin10_minute", "bin10_label", "type"])
+            .size()
+            .reset_index(name="compte")
+            .sort_values(["bin10_minute", "type"])
+        )
+
+        if not series_passages.empty:
+            line_passages = (
+                alt.Chart(series_passages)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("bin10_label:N",
+                            sort=alt.SortField(field="bin10_minute", order="ascending"),
+                            title="Heure locale (10 min)"),
+                    y=alt.Y("compte:Q", title="Nombre"),
+                    color=alt.Color("type:N", title="Type d'arrêt"),
+                    tooltip=["bin10_label", "type", "compte"]
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(line_passages, use_container_width=True)
+        else:
+            st.info("Pas de données suffisantes pour la courbe des passages.")
+    else:
+        st.info("Aucun STU à représenter pour la courbe des passages.")
+
+    # ------------------ Courbes des annulations de voyages (10 min) ------------------
+    st.markdown("### Courbes — Annulations de voyages (complètes vs partielles, 10 min)")
+    series_cancel = _trips_binning_for_cancellations(trips_view, stu_view, tz_input)
+    if not series_cancel.empty:
+        line_cancel = (
+            alt.Chart(series_cancel)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("bin10_label:N",
+                        sort=alt.SortField(field="bin10_minute", order="ascending"),
+                        title="Heure locale (10 min)"),
+                y=alt.Y("compte:Q", title="Nombre de voyages"),
+                color=alt.Color("kind:N", title="Type d'annulation"),
+                tooltip=["bin10_label", "kind", "compte"]
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(line_cancel, use_container_width=True)
+    else:
+        st.info("Pas de voyages annulés (complets ou partiels) dans la sélection.")
+
     # ------------------ Top 20 arrêts annulés ------------------
     st.markdown("### Top 20 des arrêts annulés (SKIPPED)")
     if not sk.empty:
@@ -324,51 +486,6 @@ if run_button and tu_file is not None:
     else:
         st.info("Aucun arrêt annulé dans la sélection.")
 
-    # ------------------ Heatmap par tranches de 10 minutes ------------------
-    st.markdown("### Heatmap par tranches de 10 minutes et type de passage")
-    if not stu_view.empty:
-        try:
-            # Ajoute les tranches 10 min locales
-            stu_10 = _add_local_bin10(stu_view, tz_input)
-        except Exception:
-            stu_10 = _add_local_bin10(stu_view, "UTC")
-
-        # Map du type lisible
-        stu_10 = stu_10.assign(
-            type=lambda d: d["stu_schedule_relationship"].map(_sr_label_map_stu()).fillna("AUTRE")
-        )
-
-        # Agrégation par (tranche 10 min, type)
-        dist_10 = (
-            stu_10
-            .dropna(subset=["bin10_minute"])
-            .groupby(["bin10_minute", "bin10_label", "type"])
-            .size()
-            .reset_index(name="compte")
-            .sort_values(["bin10_minute", "type"])
-        )
-
-        if not dist_10.empty:
-            heat10 = (
-                alt.Chart(dist_10)
-                .mark_rect()
-                .encode(
-                    # Trie X par la valeur numérique de la tranche (évite l'ordre alpha '01:00' vs '10:00')
-                    x=alt.X("bin10_label:N",
-                            sort=alt.SortField(field="bin10_minute", order="ascending"),
-                            title="Heure locale (tranches de 10 min)"),
-                    y=alt.Y("type:N", title="Type de passage"),
-                    color=alt.Color("compte:Q", title="Compte", scale=alt.Scale(scheme="blues")),
-                    tooltip=["bin10_label", "type", "compte"]
-                )
-                .properties(height=320)
-            )
-            st.altair_chart(heat10, use_container_width=True)
-        else:
-            st.info("Pas de données suffisantes pour la heatmap en tranches de 10 minutes.")
-    else:
-        st.info("Aucun STU à représenter pour la heatmap.")
-
     # ------------------ Comparaison au planifié ------------------
     st.markdown("### Écart vs horaire planifié (si GTFS fourni)")
     if not sched_df.empty and schedule_stats:
@@ -380,7 +497,7 @@ if run_button and tu_file is not None:
         c3.metric("Departure — médiane (s)", f"{dep.get('median_signed_sec', 0):.0f}")
         c4.metric("≤ 5 min (arrival)", f"{arr.get('within_5_min_pct', 0):.1f}%")
 
-        # Histogramme des deltas (en minutes)
+        # Histogrammes des deltas (en minutes)
         sched_plot = sched_df.copy()
         sched_plot["arr_delta_min"] = pd.to_numeric(sched_plot["arr_delta_sec"], errors="coerce") / 60.0
         sched_plot["dep_delta_min"] = pd.to_numeric(sched_plot["dep_delta_sec"], errors="coerce") / 60.0
