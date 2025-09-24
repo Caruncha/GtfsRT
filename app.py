@@ -15,10 +15,15 @@ from gtfsrt_tripupdates_report import (
     load_static_gtfs,
 )
 
-# Désactive la limite par défaut d'Altair (évite MaxRowsError dans l'app)
+# Altair : enlève la limite 5k lignes pour éviter MaxRowsError
 alt.data_transformers.enable('default', max_rows=None)
 
 st.set_page_config(page_title="🚌 Analyseur TripUpdates", layout="wide")
+
+# Watcher : évite inotify 'watch limit reached' (Streamlit Cloud / containers)
+st.set_option("server.fileWatcherType", "poll")
+# Optionnel : désactiver le relance auto sur sauvegarde
+# st.set_option("server.runOnSave", False)
 
 st.title("🚌 Analyseur GTFS‑realtime : TripUpdates")
 st.write(
@@ -221,6 +226,26 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
     # Ordonne correctement l'axe X par la valeur numérique
     out = out.sort_values(["bin10_minute", "kind"])
     return out[["bin10_minute", "bin10_label", "kind", "compte"]]
+
+# --- Histogrammes robustes (évite overflows NumPy) ---
+def _safe_histogram(series: pd.Series, bins: int = 60, clip_abs_minutes: int | None = 1440) -> pd.DataFrame:
+    """
+    Convertit en float64, retire NaN/Inf, clippe les extrêmes (±clip_abs_minutes),
+    puis calcule un histogramme sous np.errstate. Retourne {bin_center, count}.
+    """
+    s = pd.to_numeric(series, errors="coerce").astype("float64")
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return pd.DataFrame(columns=["bin_center", "count"])
+
+    if clip_abs_minutes is not None:
+        s = np.clip(s, -abs(clip_abs_minutes), abs(clip_abs_minutes))
+
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        counts, edges = np.histogram(s, bins=bins)
+
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    return pd.DataFrame({"bin_center": centers, "count": counts})
 
 # ------------------------------
 # Analyse
@@ -460,7 +485,7 @@ if run_button and tu_file is not None:
         c3.metric("Departure — médiane (s)", f"{dep.get('median_signed_sec', 0):.0f}")
         c4.metric("≤ 5 min (arrival)", f"{arr.get('within_5_min_pct', 0):.1f}%")
 
-        # Histogrammes pré-agrégés (60 bacs) pour éviter MaxRowsError
+        # Histogrammes pré-agrégés (60 bacs) — robustes
         sched_plot = sched_df.copy()
         sched_plot["arr_delta_min"] = pd.to_numeric(sched_plot["arr_delta_sec"], errors="coerce") / 60.0
         sched_plot["dep_delta_min"] = pd.to_numeric(sched_plot["dep_delta_sec"], errors="coerce") / 60.0
@@ -469,37 +494,39 @@ if run_button and tu_file is not None:
         with charts[0]:
             s = sched_plot["arr_delta_min"].dropna()
             if not s.empty:
-                counts, edges = np.histogram(s, bins=60)
-                centers = (edges[:-1] + edges[1:]) / 2.0
-                df_arr_hist = pd.DataFrame({"bin_center": centers, "count": counts})
-                chart_arr = (
-                    alt.Chart(df_arr_hist)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("bin_center:Q", title="Écart (minutes, +retard / -avance)"),
-                        y=alt.Y("count:Q", title="Nombre")
+                df_arr_hist = _safe_histogram(s, bins=60, clip_abs_minutes=1440)
+                if not df_arr_hist.empty:
+                    chart_arr = (
+                        alt.Chart(df_arr_hist)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("bin_center:Q", title="Écart (minutes, +retard / -avance)"),
+                            y=alt.Y("count:Q", title="Nombre")
+                        )
+                        .properties(height=300)
                     )
-                    .properties(height=300)
-                )
-                st.altair_chart(chart_arr, use_container_width=True)
+                    st.altair_chart(chart_arr, use_container_width=True)
+                else:
+                    st.info("Histogramme arrival : aucune donnée exploitable après nettoyage.")
             else:
                 st.info("Aucun delta arrival disponible.")
         with charts[1]:
             s = sched_plot["dep_delta_min"].dropna()
             if not s.empty:
-                counts, edges = np.histogram(s, bins=60)
-                centers = (edges[:-1] + edges[1:]) / 2.0
-                df_dep_hist = pd.DataFrame({"bin_center": centers, "count": counts})
-                chart_dep = (
-                    alt.Chart(df_dep_hist)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("bin_center:Q", title="Écart (minutes)"),
-                        y=alt.Y("count:Q", title="Nombre")
+                df_dep_hist = _safe_histogram(s, bins=60, clip_abs_minutes=1440)
+                if not df_dep_hist.empty:
+                    chart_dep = (
+                        alt.Chart(df_dep_hist)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("bin_center:Q", title="Écart (minutes)"),
+                            y=alt.Y("count:Q", title="Nombre")
+                        )
+                        .properties(height=300)
                     )
-                    .properties(height=300)
-                )
-                st.altair_chart(chart_dep, use_container_width=True)
+                    st.altair_chart(chart_dep, use_container_width=True)
+                else:
+                    st.info("Histogramme departure : aucune donnée exploitable après nettoyage.")
             else:
                 st.info("Aucun delta departure disponible.")
     else:
