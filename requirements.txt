@@ -1,4 +1,6 @@
 streamlit
 pandas
-google-transit-gtfs-realtime-bindings
+gtfs-realtime-bindings
 altair
+numpy
+tzdata
