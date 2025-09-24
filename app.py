@@ -39,7 +39,7 @@ with st.sidebar:
     st.divider()
     st.header("Options d'affichage")
     default_tz = "America/Toronto"
-    tz_input = st.text_input("Fuseau horaire (IANA)", value=default_tz, help="Ex.: America/Toronto, America/Montreal, UTC")
+    tz_input = 'America/Montreal
     st.caption("Astuce : pour de gros fichiers, augmentez la taille via `.streamlit/config.toml` → [server] maxUploadSize = 200")
     run_button = st.button("Analyser", type="primary")
 
