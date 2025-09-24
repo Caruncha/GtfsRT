@@ -8,11 +8,10 @@ Fonctions :
 - Charge un fichier TripUpdates (Protocol Buffer) — extension quelconque.
 - (Optionnel) Charge un GTFS statique pour valider la cohérence et comparer au planifié.
 - Produit un rapport : volumes, annulations, qualité des timestamps, incohérences.
-- Exporte : summary.md, summary.json, summary.html, summary_graphs.html,
-            trips.csv, stop_updates.csv, anomalies.csv, (optionnel) schedule_compare.csv
+- Exporte : summary.md, summary.json, trips.csv, stop_updates.csv, anomalies.csv,
+            (optionnel) schedule_compare.csv
 
-Installation locale :
-  pip install pandas gtfs-realtime-bindings altair tzdata numpy
+Installation locale : pip install pandas gtfs-realtime-bindings tzdata numpy
 """
 
 import argparse
@@ -26,7 +25,6 @@ from typing import Dict, Tuple, Optional, List
 import pandas as pd
 import numpy as np
 from zoneinfo import ZoneInfo
-import altair as alt  # pour la génération d'HTML graphique
 
 # Import GTFS-rt
 try:
@@ -90,7 +88,9 @@ def time_to_seconds_24hplus(hms: str) -> Optional[int]:
         return None
 
 def trip_key(trip, entity_id: str) -> Tuple[str, str, str]:
-    """Clé de voyage pour distinguer les réalisations d'un même trip_id selon date/heure de départ."""
+    """
+    Clé de voyage pour distinguer les réalisations d'un même trip_id selon date/heure de départ.
+    """
     tid = getattr(trip, "trip_id", "") or ""
     sd  = getattr(trip, "start_date", "") or ""
     st  = getattr(trip, "start_time", "") or ""
@@ -363,6 +363,7 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
             dep_time = stu.departure.time if (stu.HasField("departure") and stu.departure.HasField("time")) else None
             arr_delay = stu.arrival.delay if (stu.HasField("arrival") and stu.arrival.HasField("delay")) else None
             dep_delay = stu.departure.delay if (stu.HasField("departure") and stu.departure.HasField("delay")) else None
+
             if arr_time is None and dep_time is None and arr_delay is None and dep_delay is None:
                 empty_time_fields += 1
 
@@ -568,353 +569,8 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
     }
 
 # --------------------------------------------------------------------------------------
-# Rendu du rapport (fichiers)
+# Rendu du rapport (fichiers, **sans HTML**)
 # --------------------------------------------------------------------------------------
-
-def _build_summary_html(summary_payload: Dict) -> str:
-    """Construit un HTML autonome simple (sans graphiques) pour le résumé."""
-    meta = summary_payload.get("meta", {})
-    summary = summary_payload.get("summary", {})
-    tsq = summary_payload.get("timestamp_quality", {})
-    schedule = summary_payload.get("schedule_compare", {})
-
-    def li_items(d: Dict) -> str:
-        return "".join([f"<li><b>{k}</b> : {v}</li>" for k, v in d.items()])
-
-    html = f"""<!doctype html>
-<html lang="fr"><head>
-<meta charset="utf-8"/>
-<title>Rapport TripUpdates</title>
-<style>
-body {{ font-family: Arial, sans-serif; margin: 24px; }}
-h1, h2 {{ color: #222; }}
-.card {{ border:1px solid #e5e5e5; border-radius:8px; padding:16px; margin-bottom:16px; }}
-small {{ color:#666; }}
-</style></head>
-<body>
-<h1>Rapport GTFS-rt : TripUpdates</h1>
-<div class="card">
-  <h2>Source</h2>
-  <ul>
-    <li><b>Feed timestamp</b> : {meta.get('feed_timestamp')} <small>({meta.get('feed_timestamp_iso')})</small></li>
-    <li><b>Correction ms→s</b> : {meta.get('ms_to_s_corrected')}</li>
-    <li><b>Entités TripUpdate</b> : {meta.get('entities_with_trip_update')}</li>
-  </ul>
-</div>
-<div class="card">
-  <h2>Synthèse</h2>
-  <ul>{li_items(summary)}</ul>
-</div>
-<div class="card">
-  <h2>Qualité des timestamps</h2>
-  <ul>{li_items(tsq)}</ul>
-</div>
-<div class="card">
-  <h2>Écart vs horaire planifié</h2>
-  <pre style="white-space:pre-wrap;">{json.dumps(schedule, ensure_ascii=False, indent=2)}</pre>
-</div>
-<footer><small>Généré par gtfsrt_tripupdates_report.py</small></footer>
-</body></html>"""
-    return html
-
-# --- Génération d'un HTML graphique (Altair) ---
-
-def _event_epoch_series(stu_df: pd.DataFrame) -> pd.Series:
-    if stu_df.empty:
-        return pd.Series(dtype="float")
-    t = stu_df["departure_time"].where(stu_df["departure_time"].notna(), stu_df["arrival_time"])
-    return pd.to_numeric(t, errors="coerce")
-
-def _compute_passages_10min(stu_df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
-    """Retourne DF: bin10_minute, bin10_label, type, compte (passages par tranche 10 min)."""
-    if stu_df.empty:
-        return pd.DataFrame(columns=["bin10_minute","bin10_label","type","compte"])
-    s = _event_epoch_series(stu_df)
-    if s.empty:
-        return pd.DataFrame(columns=["bin10_minute","bin10_label","type","compte"])
-    try:
-        dt_local = pd.to_datetime(s, unit="s", utc=True).dt.tz_convert(ZoneInfo(tz_str))
-    except Exception:
-        dt_local = pd.to_datetime(s, unit="s", utc=True)
-    dt10 = dt_local.dt.floor("10min")
-    base = stu_df.assign(
-        bin10_minute=pd.to_numeric(dt10.dt.hour * 60 + dt10.dt.minute, errors="coerce").astype("Int64"),
-        bin10_label=dt10.dt.strftime("%H:%M").astype("string"),
-        type=stu_df["stu_schedule_relationship"].map(_STU_SR_MAP).fillna("AUTRE"),
-    ).dropna(subset=["bin10_minute"])
-    out = (base.groupby(["bin10_minute","bin10_label","type"])
-                .size().reset_index(name="compte")
-                .sort_values(["bin10_minute","type"]))
-    return out
-
-def _hms_to_seconds(hms: str) -> int | None:
-    if hms is None or pd.isna(hms):
-        return None
-    try:
-        h, m, s = [int(x) for x in str(hms).split(":")]
-        return h*3600 + m*60 + s
-    except Exception:
-        return None
-
-def _service_midnight_epoch(start_date: str, tz_str: str) -> int | None:
-    try:
-        y, m, d = int(start_date[:4]), int(start_date[4:6]), int(start_date[6:8])
-        return int(pd.Timestamp(y, m, d, 0, 0, 0, tz=ZoneInfo(tz_str)).timestamp())
-    except Exception:
-        return None
-
-def _compute_trip_cancellations_10min(trips_df: pd.DataFrame, stu_df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
-    """Courbes 10 min pour annulations complètes vs partielles."""
-    if trips_df.empty:
-        return pd.DataFrame(columns=["bin10_minute","bin10_label","kind","compte"])
-
-    # 1) min(event_time) par trip_key depuis STU
-    if not stu_df.empty:
-        sv = stu_df.copy()
-        sv["event_time"] = sv["departure_time"].where(sv["departure_time"].notna(), sv["arrival_time"])
-        per_trip_event = (sv.dropna(subset=["event_time"])
-                            .groupby("trip_key")["event_time"].min().rename("trip_event_epoch"))
-    else:
-        per_trip_event = pd.Series(dtype="float", name="trip_event_epoch")
-
-    tv = trips_df.copy().merge(per_trip_event, left_on="trip_key", right_index=True, how="left")
-
-    # 2) fallback start_date + start_time
-    missing = tv["trip_event_epoch"].isna()
-    if "start_date" in tv.columns and "start_time" in tv.columns:
-        midnight_epoch = tv.loc[missing, "start_date"].apply(
-            lambda sd: _service_midnight_epoch(sd, tz_str) if isinstance(sd, str) and len(sd)==8 else None
-        )
-        start_sec = tv.loc[missing, "start_time"].apply(_hms_to_seconds)
-        fallback = []
-        for me, ss in zip(midnight_epoch.tolist(), start_sec.tolist()):
-            fallback.append(None if (me is None or ss is None) else (me + ss))
-        tv.loc[missing, "trip_event_epoch"] = pd.to_numeric(pd.Series(fallback), errors="coerce")
-
-    # 3) binning temps local 10 min
-    dt_local = pd.to_datetime(tv["trip_event_epoch"], unit="s", utc=True, errors="coerce")
-    try:
-        dt_local = dt_local.dt.tz_convert(ZoneInfo(tz_str))
-    except Exception:
-        pass
-    dt10 = dt_local.dt.floor("10min")
-    tv["bin10_minute"] = pd.to_numeric(dt10.dt.hour * 60 + dt10.dt.minute, errors="coerce").astype("Int64")
-    tv["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
-
-    # 4) sets d’annulation
-    fully = set(tv.loc[tv["trip_schedule_relationship"] == 3, "trip_key"])
-    skipped = set(stu_df.loc[stu_df["stu_schedule_relationship"] == 1, "trip_key"]) if not stu_df.empty else set()
-    partial = skipped - fully
-
-    tv_ok = tv.dropna(subset=["bin10_minute"])
-    s_full = (tv_ok.loc[tv_ok["trip_key"].isin(fully)]
-                 .groupby(["bin10_minute","bin10_label"]).size().rename("compte"))
-    s_part = (tv_ok.loc[tv_ok["trip_key"].isin(partial)]
-                 .groupby(["bin10_minute","bin10_label"]).size().rename("compte"))
-
-    df_full = s_full.reset_index(); df_full["kind"] = "Annulations complètes"
-    df_part = s_part.reset_index(); df_part["kind"] = "Annulations partielles"
-    out = (pd.concat([df_full, df_part], ignore_index=True, sort=False)
-           if (not df_full.empty or not df_part.empty)
-           else pd.DataFrame(columns=["bin10_minute","bin10_label","compte","kind"]))
-    return out[["bin10_minute","bin10_label","kind","compte"]].sort_values(["bin10_minute","kind"])
-
-def build_graphical_report_html(analysis: Dict, tz_str: Optional[str] = None) -> str:
-    """
-    Construit une page HTML synthétique avec graphiques Altair (autonome, scripts via CDN).
-    """
-    # Désactive la limite 5k lignes d'Altair pour cet export
-    alt.data_transformers.enable('default', max_rows=None)
-
-    tz = tz_str or analysis.get("static_meta", {}).get("default_timezone", "UTC")
-
-    trips_df = analysis["trips_df"].copy()
-    stu_df = analysis["stu_df"].copy()
-    sched_df = analysis.get("schedule_compare_df", pd.DataFrame())
-
-    # 1) Barres de synthèse
-    canceled_trips = int((trips_df["trip_schedule_relationship"] == 3).sum()) if not trips_df.empty else 0
-    added_trips    = int((trips_df["trip_schedule_relationship"] == 1).sum()) if not trips_df.empty else 0
-    unsched_trips  = int((trips_df["trip_schedule_relationship"] == 2).sum()) if not trips_df.empty else 0
-    if not stu_df.empty:
-        sk = stu_df[stu_df["stu_schedule_relationship"] == 1]
-        trips_with_sk = set(sk["trip_key"]) if not sk.empty else set()
-        fully_canceled = set(trips_df.loc[trips_df["trip_schedule_relationship"] == 3, "trip_key"]) if not trips_df.empty else set()
-        partial_canceled = len(trips_with_sk - fully_canceled)
-        skipped_stops_total = int(len(sk))
-    else:
-        partial_canceled = 0
-        skipped_stops_total = 0
-
-    df_summary = pd.DataFrame([
-        {"type": "CANCELED (trips)", "val": canceled_trips},
-        {"type": "ADDED (trips)", "val": added_trips},
-        {"type": "UNSCHEDULED (trips)", "val": unsched_trips},
-        {"type": "PARTIAL CANCELED (trips)", "val": partial_canceled},
-        {"type": "SKIPPED (stops)", "val": skipped_stops_total},
-    ])
-
-    # 2) Donut STU
-    df_stu_dist = (stu_df.assign(type=lambda d: d["stu_schedule_relationship"].map(_STU_SR_MAP).fillna("AUTRE"))
-                   .groupby("type").size().reset_index(name="compte")) if not stu_df.empty else pd.DataFrame(columns=["type","compte"])
-
-    # 3) Passages 10 min
-    series_passages = _compute_passages_10min(stu_df, tz)
-
-    # 4) Annulations 10 min
-    series_cancel = _compute_trip_cancellations_10min(trips_df, stu_df, tz)
-
-    # 5) Histogrammes des écarts (pré-agrégés en 60 bacs)
-    hist_arr_df = pd.DataFrame()
-    hist_dep_df = pd.DataFrame()
-    if not sched_df.empty:
-        s_arr = pd.to_numeric(sched_df["arr_delta_sec"], errors="coerce") / 60.0
-        s_dep = pd.to_numeric(sched_df["dep_delta_sec"], errors="coerce") / 60.0
-
-        def _hist_counts(series: pd.Series, bins: int = 60) -> pd.DataFrame:
-            s = series.dropna()
-            if s.empty:
-                return pd.DataFrame(columns=["bin_center", "count"])
-            counts, edges = np.histogram(s, bins=bins)
-            centers = (edges[:-1] + edges[1:]) / 2.0
-            return pd.DataFrame({"bin_center": centers, "count": counts})
-
-        hist_arr_df = _hist_counts(s_arr, bins=60)
-        hist_dep_df = _hist_counts(s_dep, bins=60)
-
-    # 6) Top 20 SKIPPED
-    top_sk_df = pd.DataFrame()
-    if not stu_df.empty:
-        sk = stu_df[stu_df["stu_schedule_relationship"] == 1]
-        if not sk.empty:
-            top_sk_df = (sk.groupby("stop_id").size().reset_index(name="compte")
-                           .sort_values("compte", ascending=False).head(20))
-
-    charts = {}
-    if not df_summary.empty:
-        charts["summary_bar"] = (alt.Chart(df_summary)
-                                  .mark_bar()
-                                  .encode(x=alt.X("type:N", sort="-y", title="Catégorie"),
-                                          y=alt.Y("val:Q", title="Nombre"),
-                                          tooltip=["type","val"])
-                                  .properties(height=300, title="Synthèse (trips/stops)"))
-
-    if not df_stu_dist.empty:
-        charts["stu_donut"] = (alt.Chart(df_stu_dist)
-                                 .mark_arc(innerRadius=60)
-                                 .encode(theta="compte:Q", color="type:N",
-                                         tooltip=["type","compte"])
-                                 .properties(height=300, title="Répartition des arrêts (STU)"))
-
-    if not series_passages.empty:
-        charts["passages_line"] = (alt.Chart(series_passages)
-                                     .mark_line(point=True)
-                                     .encode(x=alt.X("bin10_label:N",
-                                                     sort=alt.SortField(field="bin10_minute", order="ascending"),
-                                                     title=f"Heure locale ({tz}) — 10 min"),
-                                             y=alt.Y("compte:Q", title="Passages"),
-                                             color=alt.Color("type:N", title="Type d'arrêt"),
-                                             tooltip=["bin10_label","type","compte"])
-                                     .properties(height=320, title="Passages par tranche de 10 minutes"))
-
-    if not series_cancel.empty:
-        charts["cancel_line"] = (alt.Chart(series_cancel)
-                                   .mark_line(point=True)
-                                   .encode(x=alt.X("bin10_label:N",
-                                                   sort=alt.SortField(field="bin10_minute", order="ascending"),
-                                                   title=f"Heure locale ({tz}) — 10 min"),
-                                           y=alt.Y("compte:Q", title="Voyages annulés"),
-                                           color=alt.Color("kind:N", title="Type d'annulation"),
-                                           tooltip=["bin10_label","kind","compte"])
-                                   .properties(height=320, title="Annulations de voyages (complètes vs partielles)"))
-
-    if not hist_arr_df.empty:
-        charts["hist_arr"] = (
-            alt.Chart(hist_arr_df)
-               .mark_bar()
-               .encode(
-                   x=alt.X("bin_center:Q", title="Écart arrival (minutes, +retard / -avance)"),
-                   y=alt.Y("count:Q", title="Nombre")
-               )
-               .properties(height=300, title="Histogramme des écarts — Arrival")
-        )
-    if not hist_dep_df.empty:
-        charts["hist_dep"] = (
-            alt.Chart(hist_dep_df)
-               .mark_bar()
-               .encode(
-                   x=alt.X("bin_center:Q", title="Écart departure (minutes)"),
-                   y=alt.Y("count:Q", title="Nombre")
-               )
-               .properties(height=300, title="Histogramme des écarts — Departure")
-        )
-
-    if not top_sk_df.empty:
-        charts["top_skipped"] = (alt.Chart(top_sk_df)
-                                   .mark_bar()
-                                   .encode(x=alt.X("compte:Q", title="Nombre de SKIPPED"),
-                                           y=alt.Y("stop_id:N", sort="-x", title="stop_id"),
-                                           tooltip=["stop_id","compte"])
-                                   .properties(height=400, title="Top 20 des stop_id SKIPPED"))
-
-    specs = {k: json.dumps(v.to_dict(), ensure_ascii=False) for k, v in charts.items()}
-
-    meta = analysis.get("meta", {})
-    html = f"""<!doctype html>
-<html lang="fr"><head>
-<meta charset="utf-8"/>
-<title>Rapport GTFS-rt — Graphiques</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<style>
-body {{ font-family: Arial, sans-serif; margin: 24px; }}
-h1,h2 {{ color:#222; }}
-.grid {{ display:grid; gap:24px; grid-template-columns: 1fr; }}
-.card {{ border:1px solid #e5e5e5; border-radius:8px; padding:16px; }}
-small {{ color:#666; }}
-</style>
-<script src.jsdelivr.net/npm/vega@5</script>
-<script src="https://net/npm/vega-lite@5</script>
-<script/cdn.jsdelivr.net/npm/vega-embed@6</script>
-</head>
-<body>
-<h1>Rapport GTFS-rt — TripUpdates (graphique)</h1>
-<div class="card">
-  <h2>Infos</h2>
-  <ul>
-    <li><b>Fuseau</b> : {tz}</li>
-    <li><b>Feed timestamp</b> : {meta.get('feed_timestamp')} <small>({meta.get('feed_timestamp_iso')})</small></li>
-    <li><b>Correction ms→s</b> : {meta.get('ms_to_s_corrected')}</li>
-    <li><b>Entités TripUpdate</b> : {meta.get('entities_with_trip_update')}</li>
-  </ul>
-</div>
-
-<div class="grid">
-  <div id="summary_bar" class="card"></div>
-  <div id="stu_donut" class="card"></div>
-  <div id="passages_line" class="card"></div>
-  <div id="cancel_line" class="card"></div>
-  <div id="hist_arr" class="card"></div>
-  <div id="hist_dep" class="card"></div>
-  <div id="top_skipped" class="card"></div>
-</div>
-
-<script>
-const specs = {{
-  {", ".join([f'"{k}": {v}' for k, v in specs.items()])}
-}};
-for (const id in specs) {{
-  const el = document.getElementById(id);
-  if (el && specs[id]) {{
-    vegaEmbed('#'+id, specs[id], {{actions:false}});
-  }} else if (el) {{
-    el.innerHTML = "<em>Données indisponibles pour ce graphique.</em>";
-  }}
-}}
-</script>
-
-<footer><small>Généré par gtfsrt_tripupdates_report.py — {datetime.utcnow().isoformat()}Z</small></footer>
-</body></html>"""
-    return html
 
 def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optional[str]):
     ensure_dir(out_dir)
@@ -998,21 +654,6 @@ def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optiona
         if sched_cmp_csv:
             f.write(f"- `schedule_compare.csv` : écart prédiction vs planifié par STU\n")
 
-    # HTML simple autonome
-    html_path = os.path.join(out_dir, "summary.html")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(_build_summary_html(summary_payload))
-
-    # HTML graphique (charts Altair)
-    html_graphs_path = os.path.join(out_dir, "summary_graphs.html")
-    try:
-        tz = analysis.get("static_meta", {}).get("default_timezone", "UTC")
-        html_graphs = build_graphical_report_html(analysis, tz_str=tz)
-        with open(html_graphs_path, "w", encoding="utf-8") as f:
-            f.write(html_graphs)
-    except Exception:
-        html_graphs_path = None  # on n'interrompt pas si un graphique échoue
-
     return {
         "trips_csv": trips_csv,
         "stus_csv": stus_csv,
@@ -1020,8 +661,6 @@ def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optiona
         "schedule_compare_csv": sched_cmp_csv,
         "summary_json": os.path.join(out_dir, "summary.json"),
         "summary_md": md_path,
-        "summary_html": html_path,
-        "summary_graphs_html": html_graphs_path,
     }
 
 # --------------------------------------------------------------------------------------
