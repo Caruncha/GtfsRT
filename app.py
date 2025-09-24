@@ -231,6 +231,23 @@ def _safe_histogram(series: pd.Series, bins: int = 60, clip_abs_minutes: int | N
     centers = (edges[:-1] + edges[1:]) / 2.0
     return pd.DataFrame({"bin_center": centers, "count": counts})
 
+# --- Helpers schéma minimal pour éviter les KeyError sur merge/select ---
+def _ensure_min_schema(df: pd.DataFrame, required: dict) -> pd.DataFrame:
+    """
+    Ajoute les colonnes manquantes avec le dtype indiqué si nécessaire.
+    Exemple required: {"trip_key": "string", "route_id": "string", "trip_id": "string"}
+    """
+    out = df.copy()
+    for col, dtype in required.items():
+        if col not in out.columns:
+            try:
+                out[col] = pd.Series([], dtype=dtype)
+            except Exception:
+                # repli: dtype object si non supporté (ex. Int64 non dispo localement)
+                out[col] = pd.Series([], dtype="object")
+    return out
+
+
 # ------------------------------
 # Analyse
 # ------------------------------
@@ -257,8 +274,29 @@ if run_button and tu_file is not None:
         except Exception:
             pass
 
-    trips_df = analysis["trips_df"]
-    stu_df = analysis["stu_df"]
+    trips_df = analysis["trips_df"].copy()
+    stu_df   = analysis["stu_df"].copy()
+
+# Garantit le schéma minimal (même si DataFrame vide)
+trips_df = _ensure_min_schema(trips_df, {
+    "trip_key": "string",
+    "route_id": "string",
+    "trip_id":  "string",
+    "start_date": "string",
+    "start_time": "string",
+    "trip_schedule_relationship": "Int64",
+})
+stu_df = _ensure_min_schema(stu_df, {
+    "trip_key": "string",
+    "route_id": "string",
+    "trip_id":  "string",
+    "stop_id":  "string",
+    "stop_sequence": "Int64",
+    "stu_schedule_relationship": "Int64",
+    "arrival_time": "float",
+    "departure_time": "float",
+})
+
     anomalies_df = analysis["anomalies"]
     sched_df = analysis.get("schedule_compare_df", pd.DataFrame())
     schedule_stats = analysis.get("schedule_stats", {})
@@ -293,7 +331,13 @@ if run_button and tu_file is not None:
     if trip_id_query:
         trips_view = trips_view[trips_view["trip_id"].fillna("").str.contains(trip_id_query, case=False)]
 
-    stu_view = stu_df.merge(trips_df[["trip_key", "route_id", "trip_id"]], on="trip_key", how="left", suffixes=("", "_t"))
+    merge_cols = [c for c in ["trip_key", "route_id", "trip_id"] if c in trips_df.columns]
+if "trip_key" in stu_df.columns and "trip_key" in merge_cols:
+    stu_view = stu_df.merge(trips_df[merge_cols], on="trip_key", how="left", suffixes=("", "_t"))
+else:
+    # Cas ultra-dégénéré: on n’a pas de clé; on garde stu_df tel quel.
+    stu_view = stu_df.copy()
+
     if route_sel:
         stu_view = stu_view[stu_view["route_id"].isin(route_sel)]
     if trip_id_query:
@@ -572,6 +616,5 @@ if run_button and tu_file is not None:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
-
 
 
