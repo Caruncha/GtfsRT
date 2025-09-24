@@ -30,55 +30,17 @@ st.write(
 # -----------------------------------------------------------------------------
 # Uploaders & options (sidebar)
 # -----------------------------------------------------------------------------
-# --- (dans la sidebar) : bouton pour vider le cache ---
 with st.sidebar:
     st.header("Fichiers")
-    tu_file = st.file_uploader("Fichier TripUpdates (Protocol Buffer GTFS‑rt – extension quelconque)", type=None)
+    tu_file = st.file_uploader(
+        "Fichier TripUpdates (Protocol Buffer GTFS‑rt – extension quelconque)",
+        type=None  # accepte tout
+    )
     gtfs_file = st.file_uploader("GTFS statique (zip) (optionnel)", type=["zip"])
     st.divider()
     st.header("Options")
-    st.caption("Astuce : `.streamlit/config.toml` → [server] maxUploadSize = 200")
+    st.caption("Astuce : pour de gros fichiers, augmentez la taille via `.streamlit/config.toml` → [server] maxUploadSize = 200")
     run_button = st.button("Analyser", type="primary")
-    # 🔧 Reset cache (utile après modification du code)
-    if st.button("♻️ Réinitialiser le cache"):
-        st.cache_data.clear()
-        st.experimental_rerun()
-
-# --- bloc principal ---
-if run_button and tu_file is not None:
-    try:
-        with st.spinner("Analyse en cours…"):
-            analysis, static_gtfs = run_analysis_cached(
-                tu_file.getvalue(),
-                gtfs_file.getvalue() if gtfs_file else None
-            )
-    except Exception as e:
-        st.error("❌ Le fichier fourni ne semble pas être un **GTFS‑rt TripUpdates** valide (Protocol Buffer).")
-        st.caption(f"Détail technique : {type(e).__name__}: {e}")
-        st.stop()
-
-    # ✅ Diagnostics/validations **APRÈS** la création d'analysis
-    st.caption(f"Debug → type(analysis) = {type(analysis)}")
-    if not isinstance(analysis, dict):
-        st.error("❌ L'analyse n'a pas renvoyé un dict. Cliquez sur **♻️ Réinitialiser le cache** puis relancez.")
-        st.stop()
-
-    missing = {"trips_df", "stu_df", "anomalies"} - set(analysis.keys())
-    if missing:
-        st.error(f"❌ L'analyse est incomplète (clés manquantes : {sorted(missing)}). "
-                 "Cliquez sur **♻️ Réinitialiser le cache** puis relancez.")
-        st.stop()
-
-    # À partir d’ici, on peut accéder en toute sécurité :
-    trips_df = analysis["trips_df"].copy()
-    stu_df = analysis["stu_df"].copy()
-    anomalies_df = analysis["anomalies"].copy()
-    sched_df = analysis.get("schedule_compare_df", pd.DataFrame())
-    schedule_stats = analysis.get("schedule_stats", {})
-    # ... (le reste de ton code inchangé)
-else:
-    st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser**.")
-
 
 # -----------------------------------------------------------------------------
 # Cache d'analyse
@@ -160,18 +122,10 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
 
 # --- Helpers annulations (10 min) ---
 def _hms_to_seconds(hms: Optional[str]) -> Optional[int]:
-    """Accepte HH:MM ou HH:MM:SS (seconds facultatives)."""
     if hms is None or pd.isna(hms):
         return None
     try:
-        parts = [int(x) for x in str(hms).split(":")]
-        if len(parts) == 3:
-            h, m, s = parts
-        elif len(parts) == 2:
-            h, m = parts
-            s = 0
-        else:
-            return None
+        h, m, s = [int(x) for x in str(hms).split(":")]
         return h * 3600 + m * 60 + s
     except Exception:
         return None
@@ -738,8 +692,3 @@ if run_button and tu_file is not None:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
-
-
-
-
-
