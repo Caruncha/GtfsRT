@@ -2,15 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Analyseur GTFS-rt TripUpdates — Rapport complet (CLI)
+
 Fonctions :
 - Charge un fichier TripUpdates (Protocol Buffer) — extension quelconque.
 - (Optionnel) Charge un GTFS statique pour valider la cohérence et comparer au planifié.
 - Produit un rapport : volumes, annulations, qualité des timestamps, incohérences.
 - Exporte : summary.md, summary.json, trips.csv, stop_updates.csv, anomalies.csv,
   (optionnel) schedule_compare.csv
-- (Nouveau) Valide un CSV d’annulations (complètes/partielles) dans une fenêtre temporelle.
-Installation locale :
-  pip install pandas gtfs-realtime-bindings tzdata numpy
 """
 import argparse
 import os
@@ -36,7 +34,7 @@ _STU_SR_MAP = {0: "SCHEDULED", 1: "SKIPPED", 2: "NO_DATA"}
 _TRIP_SR_MAP = {0: "SCHEDULED", 1: "ADDED", 2: "UNSCHEDULED", 3: "CANCELED"}
 
 
-# ----------------------------- Utilitaires -----------------------------------
+# ------------------------------ Utilitaires ---------------------------------
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
@@ -87,19 +85,18 @@ def time_to_seconds_24hplus(hms: str) -> Optional[int]:
         return None
 
 
-def trip_key(trip, entity_id: str) -> Tuple[str, str, str]:
+def trip_key(trip, entity_id: str) -> Tuple[str, str]:
     """
-    Clé de voyage pour distinguer les réalisations d'un même trip_id selon date/heure de départ.
+    Clé de voyage pour distinguer les réalisations d'un même trip_id selon date.
     """
     tid = getattr(trip, "trip_id", "") or ""
     sd = getattr(trip, "start_date", "") or ""
-    st = getattr(trip, "start_time", "") or ""
-    if not (tid or sd or st):
-        return (f"entity:{entity_id}", "", "")
-    return (tid, sd, st)
+    if not (tid or sd):
+        return (f"entity:{entity_id}", "")
+    return (tid, sd)
 
 
-# ----------------------- Chargement GTFS statique -----------------------------
+# ------------------------- Chargement GTFS statique --------------------------
 def load_static_gtfs(path: Optional[str]) -> Dict[str, pd.DataFrame]:
     """
     Charge un GTFS statique depuis un zip ou un dossier.
@@ -129,7 +126,6 @@ def load_static_gtfs(path: Optional[str]) -> Dict[str, pd.DataFrame]:
 
     if os.path.isdir(path):
         stops = read_csv_from_dir(path, "stops.txt", dtype={"stop_id": str, "stop_name": str})
-        # direction_id est optionnelle : on la normalisera après lecture
         trips = read_csv_from_dir(path, "trips.txt", dtype={"trip_id": str, "route_id": str})
         stop_times = read_csv_from_dir(
             path, "stop_times.txt",
@@ -141,7 +137,6 @@ def load_static_gtfs(path: Optional[str]) -> Dict[str, pd.DataFrame]:
     else:
         with zipfile.ZipFile(path, "r") as zf:
             stops = read_csv_from_zip(zf, "stops.txt", dtype={"stop_id": str, "stop_name": str})
-            # direction_id est optionnelle : on la normalisera après lecture
             trips = read_csv_from_zip(zf, "trips.txt", dtype={"trip_id": str, "route_id": str})
             stop_times = read_csv_from_zip(
                 zf, "stop_times.txt",
@@ -158,10 +153,6 @@ def load_static_gtfs(path: Optional[str]) -> Dict[str, pd.DataFrame]:
             if c in df.columns:
                 df[c] = df[c].astype(str)
 
-    # Normalise direction_id si disponible
-    if "direction_id" in trips.columns:
-        trips["direction_id"] = pd.to_numeric(trips["direction_id"], errors="coerce").astype("Int64")
-
     if not stop_times.empty:
         stop_times["trip_id"] = stop_times["trip_id"].astype(str)
         stop_times["stop_id"] = stop_times["stop_id"].astype(str)
@@ -171,7 +162,7 @@ def load_static_gtfs(path: Optional[str]) -> Dict[str, pd.DataFrame]:
     return {"stops": stops, "trips": trips, "stop_times": stop_times, "routes": routes, "agency": agency}
 
 
-# ----------- Comparaison planifié vs RT (schedule) ----------------------------
+# -------------------- Comparaison planifié vs RT (schedule) ------------------
 def _default_agency_tz(static_gtfs: Dict[str, pd.DataFrame]) -> str:
     ag = static_gtfs.get("agency", pd.DataFrame())
     if not ag.empty and "agency_timezone" in ag.columns and pd.notna(ag.iloc[0]["agency_timezone"]):
@@ -317,255 +308,28 @@ def compute_schedule_deltas(stu_df: pd.DataFrame, static_gtfs: Dict[str, pd.Data
     return comp, stats
 
 
-# -------- Validation d’un CSV d’annulations (fenêtre) ------------------------
-def _to_yyyymmdd_startdate(x: Union[str, int, float]) -> str:
-    """Convertit 'dd/mm/yyyy' -> 'YYYYMMDD'; laisse tel quel si déjà 'YYYYMMDD'."""
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    s = str(x).strip()
-    if len(s) == 8 and s.isdigit():  # déjà YYYYMMDD
-        return s
-    try:
-        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-        if pd.isna(dt):
-            return ""
-        return dt.strftime("%Y%m%d")
-    except Exception:
-        return ""
-
-
-def _coalesce_event_time_epoch(stu: pd.DataFrame) -> pd.Series:
-    """Choisit departure_time (si dispo), sinon arrival_time (epoch s)."""
-    if stu.empty:
-        return pd.Series([], dtype="float")
-    t = stu["departure_time"].where(stu["departure_time"].notna(), stu["arrival_time"])
-    return pd.to_numeric(t, errors="coerce")
-
-
-def _first_last_event_iso(stu_trip: pd.DataFrame, tz: str) -> tuple[Optional[str], Optional[str]]:
-    s = _coalesce_event_time_epoch(stu_trip).dropna()
-    if s.empty:
-        return None, None
-    fst = int(np.nanmin(s))
-    lst = int(np.nanmax(s))
-    try:
-        fst_iso = datetime.fromtimestamp(fst, tz=ZoneInfo(tz)).isoformat()
-        lst_iso = datetime.fromtimestamp(lst, tz=ZoneInfo(tz)).isoformat()
-    except Exception:
-        fst_iso = datetime.fromtimestamp(fst, tz=timezone.utc).isoformat()
-        lst_iso = datetime.fromtimestamp(lst, tz=timezone.utc).isoformat()
-    return fst_iso, lst_iso
-
-
-def _trip_fallback_epoch(trip_row: pd.Series, tz: str) -> Optional[int]:
+# ---------------------- Analyse GTFS-realtime TripUpdates --------------------
+def get_trip_start_time_from_gtfs(trip_id: str, static_gtfs: Dict[str, pd.DataFrame]) -> Optional[str]:
     """
-    Si un trip n'a pas de STU dans la fenêtre (ex: trip annulé complet),
-    on approxime l'instant du voyage via start_date + start_time s'il existe.
+    Récupère le departure_time du premier arrêt (stop_sequence=1) pour un trip_id donné depuis le GTFS statique.
+    Retourne None si non trouvé ou GTFS non disponible.
     """
-    start_date = str(trip_row.get("start_date") or "")
-    start_time = str(trip_row.get("start_time") or "")
-    if not start_date or not start_time:
+    stop_times = static_gtfs.get("stop_times", pd.DataFrame())
+    if stop_times.empty:
         return None
-    try:
-        parts = start_time.split(":")
-        if len(parts) == 2:  # HH:MM
-            h, m = int(parts[0]), int(parts[1]); s = 0
-        elif len(parts) == 3:
-            h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-        else:
-            return None
-        sec = h * 3600 + m * 60 + s
-        midnight = _service_midnight_epoch_utc(start_date, tz)
-        if midnight is None:
-            return None
-        return int(midnight + sec)
-    except Exception:
+    first_stop = stop_times[(stop_times["trip_id"] == trip_id) & (stop_times["stop_sequence"] == 1)]
+    if first_stop.empty:
         return None
+    return first_stop.iloc[0]["departure_time"] if "departure_time" in first_stop.columns else None
 
 
-def _in_window_epoch(val: Union[int, float, None], t0: int, t1: int) -> bool:
-    if val is None or pd.isna(val):
-        return False
-    try:
-        v = int(val)
-    except Exception:
-        return False
-    return (v >= t0) and (v < t1)
-
-
-def validate_cancellations_against_tripupdates(
-    cancel_df: pd.DataFrame,
-    analysis: Dict,
-    window_start: Union[str, int, float, None] = None,  # ISO ou epoch s ; si None, utilise feed.header.timestamp
-    window_hours: int = 2,
-    tz: str = "America/Montreal"
-) -> Dict[str, Union[pd.DataFrame, Dict]]:
-    """
-    Valide que chaque ligne d’un CSV d’annulations (Trip_id,Start_date,Route_id,Stop_id,Stop_seq)
-    est bien représentée dans les TripUpdates chargés, au sein d’une fenêtre [t0, t0+2h).
-    Règles:
-    - Annulation complète (Stop_id/Stop_seq vides) -> présence d’un trip avec trip_schedule_relationship == CANCELED.
-    - Annulation partielle (Stop_id et Stop_seq) -> arrêts < Stop_seq SKIPPED et reprise à >= Stop_seq (SCHEDULED/NO_DATA).
-    Le filtrage par fenêtre repose sur les event times STU (departure->arrival) ; pour un trip CANCELED sans STU,
-    on utilise un fallback epoch basé sur start_date+start_time s’il est disponible.
-    """
-    trips_df: pd.DataFrame = analysis.get("trips_df", pd.DataFrame()).copy()
-    stu_df: pd.DataFrame = analysis.get("stu_df", pd.DataFrame()).copy()
-    feed_ts: Union[int, None] = analysis.get("meta", {}).get("feed_timestamp")
-
-    # Prépare fenêtre
-    if window_start is None:
-        if feed_ts is None:
-            raise ValueError("Aucun window_start fourni et feed.header.timestamp absent.")
-        t0 = int(feed_ts)
-    else:
-        # accepte epoch ou ISO
-        if isinstance(window_start, (int, float)) and not pd.isna(window_start):
-            t0 = int(window_start)
-        else:
-            t0 = int(pd.Timestamp(str(window_start)).timestamp())
-    t1 = t0 + int(window_hours) * 3600
-
-    # Normalise types clefs
-    for c in ("trip_id", "route_id", "start_date"):
-        if c in trips_df.columns:
-            trips_df[c] = trips_df[c].astype(str)
-    for c in ("trip_id", "route_id", "start_date", "stop_id"):
-        if c in stu_df.columns:
-            stu_df[c] = stu_df[c].astype(str)
-
-    # Ajoute série event_time aux STU
-    if not stu_df.empty:
-        stu_df["event_time"] = _coalesce_event_time_epoch(stu_df)
-
-    # Prépare CSV annulations
-    c = cancel_df.copy()
-    c["Trip_id"] = c["Trip_id"].astype(str)
-    c["Route_id"] = c["Route_id"].astype(str)
-    if "Stop_id" in c.columns:
-        c["Stop_id"] = c["Stop_id"].astype(str).replace({"": np.nan})
-    if "Stop_seq" in c.columns:
-        c["Stop_seq"] = pd.to_numeric(c["Stop_seq"], errors="coerce")
-    c["start_date_rt"] = c["Start_date"].apply(_to_yyyymmdd_startdate)
-    c["is_partial"] = c["Stop_id"].notna() & c["Stop_seq"].notna()
-
-    rows = []
-    for _, r in c.iterrows():
-        trip_id = r["Trip_id"]
-        route_id = r.get("Route_id", None)
-        sd_rt = r["start_date_rt"]
-        stop_id_csv = r.get("Stop_id", np.nan)
-        stop_seq_csv = r.get("Stop_seq", np.nan)
-        is_partial = bool(r["is_partial"])
-
-        # Filtre trips/stu pour ce trip_id + start_date (et route si fournie)
-        trips_sel = trips_df[(trips_df["trip_id"] == trip_id) & (trips_df["start_date"] == sd_rt)]
-        if isinstance(route_id, str) and route_id != "" and "route_id" in trips_sel.columns:
-            trips_sel = trips_sel[trips_sel["route_id"] == route_id]
-        stu_sel = stu_df[(stu_df["trip_id"] == trip_id) & (stu_df["start_date"] == sd_rt)]
-        if isinstance(route_id, str) and route_id != "" and "route_id" in stu_sel.columns:
-            stu_sel = stu_sel[stu_sel["route_id"] == route_id]
-
-        # Fenêtre temporelle (sur STU uniquement)
-        stu_win = stu_sel
-        if not stu_sel.empty and "event_time" in stu_sel.columns:
-            stu_win = stu_sel[(stu_sel["event_time"] >= t0) & (stu_sel["event_time"] < t1)]
-
-        # FULL CANCELLATION
-        found_full = None
-        in_window_full = None
-        if not is_partial:
-            found_full = False
-            if not trips_sel.empty and "trip_schedule_relationship" in trips_sel.columns:
-                # 3 == CANCELED
-                found_full = bool((trips_sel["trip_schedule_relationship"] == 3).any())
-            # évalue la fenêtre via STU ou fallback
-            if not stu_win.empty:
-                in_window_full = True
-            else:
-                in_window_full = False
-                if not trips_sel.empty:
-                    for _, trow in trips_sel.iterrows():
-                        ep = _trip_fallback_epoch(trow, tz)
-                        if _in_window_epoch(ep, t0, t1):
-                            in_window_full = True
-                            break
-
-        # PARTIAL CANCELLATION
-        found_partial = None
-        partial_anchor_match = None
-        first_ns_stop_id = None
-        if is_partial:
-            found_partial = False
-            # Règle: au moins un arrêt < Stop_seq SKIPPED, et le 1er arrêt non-SKIPPED a stop_sequence >= Stop_seq
-            non_skipped_vals = {0, 2}  # SCHEDULED, NO_DATA
-            st = stu_win if not stu_win.empty else stu_sel  # si aucun STU dans fenêtre, on tente sans fenêtre
-            if not st.empty and pd.notna(stop_seq_csv):
-                prior_skipped = ((pd.to_numeric(st["stop_sequence"], errors="coerce") < int(stop_seq_csv)) &
-                                 (st["stu_schedule_relationship"] == 1)).any()  # 1 == SKIPPED
-                ns = st[st["stu_schedule_relationship"].isin(list(non_skipped_vals))]
-                if not ns.empty:
-                    min_ns_seq = pd.to_numeric(ns["stop_sequence"], errors="coerce").dropna().min()
-                    if pd.notna(min_ns_seq):
-                        found_partial = bool(prior_skipped and (int(min_ns_seq) >= int(stop_seq_csv)))
-                    # vérifier l'ancre Stop_id si fourni
-                    first_ns = ns.loc[pd.to_numeric(ns["stop_sequence"], errors="coerce") == min_ns_seq]
-                    if not first_ns.empty:
-                        first_ns_stop_id = str(first_ns.iloc[0]["stop_id"]) if "stop_id" in first_ns.columns else None
-                        if pd.notna(stop_id_csv) and isinstance(stop_id_csv, str) and stop_id_csv != "":
-                            partial_anchor_match = (first_ns_stop_id == stop_id_csv)
-
-        # Résumé temps
-        fst_iso, lst_iso = (None, None)
-        base_for_time = stu_win if not stu_win.empty else stu_sel
-        if not base_for_time.empty:
-            fst_iso, lst_iso = _first_last_event_iso(base_for_time, tz)
-
-        # Statut final
-        status = "UNKNOWN"
-        if is_partial:
-            status = "OK_PARTIAL" if bool(found_partial) else "MISSING_PARTIAL"
-        else:
-            # on exige found_full ET (trip vu dans la fenêtre via STU ou fallback temps)
-            if bool(found_full) and (in_window_full is True):
-                status = "OK_FULL"
-            else:
-                status = "MISSING_FULL"
-
-        rows.append({
-            "Trip_id": trip_id,
-            "Start_date": r["Start_date"],
-            "Route_id": route_id,
-            "Stop_id": stop_id_csv if is_partial else None,
-            "Stop_seq": int(stop_seq_csv) if pd.notna(stop_seq_csv) else None,
-            "is_partial": is_partial,
-            "status": status,
-            "found_full": bool(found_full) if found_full is not None else None,
-            "found_partial": bool(found_partial) if found_partial is not None else None,
-            "partial_anchor_match": partial_anchor_match,
-            "first_event_time_iso": fst_iso,
-            "last_event_time_iso": lst_iso,
-            "stu_rows_considered": int(len(base_for_time)) if base_for_time is not None else 0
-        })
-
-    res = pd.DataFrame(rows)
-    summary = {
-        "n": int(len(res)),
-        "ok_full": int((res["status"] == "OK_FULL").sum()),
-        "ok_partial": int((res["status"] == "OK_PARTIAL").sum()),
-        "miss_full": int((res["status"] == "MISSING_FULL").sum()),
-        "miss_partial": int((res["status"] == "MISSING_PARTIAL").sum()),
-    }
-    return {"results": res, "summary": summary, "window_start_epoch": t0, "window_end_epoch": t1, "tz": tz}
-
-
-# ------------------- Analyse GTFS-realtime TripUpdates ------------------------
 def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
     # Lecture du feed
     with open(pb_path, "rb") as f:
         data = f.read()
     feed = gtfs_rt.FeedMessage()
     feed.ParseFromString(data)
+
     header_ts = feed.header.timestamp if feed.header.HasField("timestamp") else None
     feed_ts_iso = unix_to_iso(header_ts)
 
@@ -588,13 +352,12 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
         entity_count += 1
         tu = ent.trip_update
         td = tu.trip
-
         tkey = trip_key(td, ent.id)
         t_sched_rel = td.schedule_relationship if td.HasField("schedule_relationship") else 0
         t_route_id = td.route_id if td.HasField("route_id") else ""
         t_trip_id = td.trip_id if td.HasField("trip_id") else ""
         t_start_date = td.start_date if td.HasField("start_date") else ""
-        t_start_time = td.start_time if td.HasField("start_time") else ""
+        t_start_time_gtfs = get_trip_start_time_from_gtfs(t_trip_id, static_gtfs) if static_gtfs else None
 
         last_time_for_monotonic = None
         last_seq = -1
@@ -614,7 +377,6 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
 
             stop_id = stu.stop_id if stu.HasField("stop_id") else ""
             stop_seq = stu.stop_sequence if stu.HasField("stop_sequence") else None
-
             arr_time = stu.arrival.time if (stu.HasField("arrival") and stu.arrival.HasField("time")) else None
             dep_time = stu.departure.time if (stu.HasField("departure") and stu.departure.HasField("time")) else None
             arr_delay = stu.arrival.delay if (stu.HasField("arrival") and stu.arrival.HasField("delay")) else None
@@ -622,6 +384,7 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
 
             if arr_time is None and dep_time is None and arr_delay is None and dep_delay is None:
                 empty_time_fields += 1
+
             if arr_time is not None:
                 time_samples.append(arr_time)
             if dep_time is not None:
@@ -679,7 +442,7 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
                 "trip_key": "\n".join(tkey),
                 "trip_id": t_trip_id,
                 "start_date": t_start_date,
-                "start_time": t_start_time,
+                "start_time": t_start_time_gtfs,
                 "route_id": t_route_id,
                 "stop_id": stop_id,
                 "stop_sequence": stop_seq,
@@ -704,7 +467,7 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
             "trip_key": "\n".join(tkey),
             "trip_id": t_trip_id,
             "start_date": t_start_date,
-            "start_time": t_start_time,
+            "start_time": t_start_time_gtfs,
             "route_id": t_route_id,
             "trip_schedule_relationship": t_sched_rel,
             "canceled_stops": canceled_stops,
@@ -811,99 +574,25 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
             "non_monotonic_times_trips": None,
         }
 
-# ---------------------- Post-traitements demandés ----------------------
-    # Objectifs:
-    #  - start_time (trips) = heure planifiée du 1er arrêt (stop_times.txt), HH:MM
-    #  - trip_key (trips & stu) = trip_id (sans start_time / start_date)
-    #  - conserver direction_id / direction_label si dispo
-
-    if not trips_df.empty:
-        # Sauvegarde des anciennes clés pour re-mapper les STU
-        trips_df["__old_trip_key"] = trips_df["trip_key"]
-
-        # --- Fallback 1 (si pas de GTFS statique) : dérive HH:MM depuis les STU (event_time min) ---
-        stu_hhmm_by_oldkey = {}
-        if not stu_df.empty:
-            st = stu_df.copy()
-            st["event_time"] = st["departure_time"].where(st["departure_time"].notna(), st["arrival_time"])
-            st["event_time"] = pd.to_numeric(st["event_time"], errors="coerce")
-            # Heures locales via tz par trip_id (si connu), sinon tz par défaut
-            tz_map = _trip_timezone_map(static_gtfs)
-            tz_default = _default_agency_tz(static_gtfs)
-
-            for tkey_val, g in st.groupby("trip_key"):
-                et = g["event_time"].dropna()
-                if et.empty:
-                    continue
-                epoch = int(np.nanmin(et))
-                # trip_id courant (via trips_df)
-                try:
-                    tid = trips_df.loc[trips_df["__old_trip_key"] == tkey_val, "trip_id"].iloc[0]
-                except Exception:
-                    tid = None
-                tz_used = tz_map.get(str(tid), tz_default) if (tid not in (None, "", np.nan)) else tz_default
-                try:
-                    hhmm = datetime.fromtimestamp(epoch, tz=ZoneInfo(tz_used)).strftime("%H:%M")
-                except Exception:
-                    hhmm = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%H:%M")
-                stu_hhmm_by_oldkey[tkey_val] = hhmm
-
-        # Pré-remplit start_time via STU (si dispo), sinon tronque TripDescriptor.start_time
-        trips_df["start_time"] = trips_df.apply(
-            lambda r: stu_hhmm_by_oldkey.get(
-                r["__old_trip_key"],
-                (str(r.get("start_time", ""))[:5] if isinstance(r.get("start_time", ""), str) and len(str(r.get("start_time", ""))) >= 5 else "")
-            ),
-            axis=1
-        ).astype(str)
-
-        # --- Source officielle (prioritaire) : GTFS statique stop_times.txt (1er arrêt) ---
-        st_static = static_gtfs.get("stop_times", pd.DataFrame())
-        if not st_static.empty and {"trip_id", "stop_sequence", "arrival_time", "departure_time"}.issubset(st_static.columns):
-            st_first = (
-                st_static
-                .sort_values("stop_sequence", kind="mergesort")  # stable
-                .groupby("trip_id", as_index=False)
-                .first()[["trip_id", "arrival_time", "departure_time"]]
-            )
-
-            def _pick_hhmm(row):
-                # priorité au depart, sinon arrival ; format HH:MM
-                hms = row["departure_time"] if pd.notna(row["departure_time"]) and row["departure_time"] != "" else row["arrival_time"]
-                hms = "" if pd.isna(hms) else str(hms)
-                return hms[:5] if len(hms) >= 5 else ""
-
-            st_first["start_hhmm_static"] = st_first.apply(_pick_hhmm, axis=1)
-            map_static = dict(zip(st_first["trip_id"].astype(str), st_first["start_hhmm_static"].astype(str)))
-            # Override avec le planifié quand présent
-            trips_df["start_time"] = trips_df.apply(
-                lambda r: (map_static.get(str(r.get("trip_id", ""))) or r["start_time"]),
-                axis=1
-            ).astype(str)
-
-        # --- trip_key = trip_id (sans heure / sans date) ---
-        trips_df["trip_key"] = trips_df["trip_id"].astype(str)
-
-        # Re-map des clés dans stu_df pour garder la cohérence avec l'app
-        if not stu_df.empty and "trip_key" in stu_df.columns:
-            key_map = dict(zip(trips_df["__old_trip_key"], trips_df["trip_key"]))
-            stu_df["trip_key"] = stu_df["trip_key"].map(lambda k: key_map.get(k, k))
-
-        trips_df.drop(columns=["__old_trip_key"], inplace=True)
-
-        # --- Direction depuis trips.txt si dispo ---
-        static_trips = static_gtfs.get("trips", pd.DataFrame())
-        if not static_trips.empty and {"trip_id", "direction_id"}.issubset(static_trips.columns):
-            dir_df = static_trips[["trip_id", "direction_id"]].copy()
-            dir_df["direction_id"] = pd.to_numeric(dir_df["direction_id"], errors="coerce").astype("Int64")
-            trips_df = trips_df.merge(dir_df, on="trip_id", how="left")
-            trips_df["direction_label"] = trips_df["direction_id"].map({1: "Ouest/Sud", 0: "Est/Nord"}).astype("string")
+    return {
+        "meta": meta,
+        "summary": summary,
+        "ts_quality": ts_quality,
+        "trips_df": trips_df,
+        "stu_df": stu_df,
+        "anomalies": pd.DataFrame(anomalies),
+        "schedule_compare_df": schedule_compare_df,
+        "schedule_stats": schedule_stats,
+        "static_meta": {
+            "default_timezone": _default_agency_tz(static_gtfs) if static_gtfs else "UTC"
+        }
+    }
 
 
-
-# ----------------------- Rendu rapport (fichiers) -----------------------------
-def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optional[str], validation: Optional[Dict]=None):
+# --------------------- Rendu du rapport (fichiers, sans HTML) ----------------
+def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optional[str]):
     ensure_dir(out_dir)
+
     trips_df = analysis["trips_df"].copy()
     stu_df = analysis["stu_df"].copy()
     anomalies_df = analysis["anomalies"].copy()
@@ -940,12 +629,6 @@ def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optiona
             "schedule_compare_rows": int(len(sched_df)) if not sched_df.empty else 0
         }
     }
-    if validation:
-        summary_payload["cancellations"] = {
-            "summary": validation.get("cancellations_summary", {}),
-            "window": validation.get("window", {}),
-            "files": {"results_csv": validation.get("cancellations_validation_csv")}
-        }
 
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary_payload, f, indent=2, ensure_ascii=False)
@@ -987,15 +670,6 @@ def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optiona
         else:
             f.write("- Aucune comparaison possible (GTFS statique manquant ou données insuffisantes)\n")
 
-        if validation:
-            f.write("\n## Validation des annulations (fenêtre)\n")
-            csum = validation.get("cancellations_summary", {})
-            win = validation.get("window", {})
-            f.write(f"- Résumé : {csum}\n")
-            f.write(f"- Fenêtre : start_epoch={win.get('start_epoch')} → end_epoch={win.get('end_epoch')} ({win.get('tz')})\n")
-            if validation.get("cancellations_validation_csv"):
-                f.write(f"- Fichier : `{validation.get('cancellations_validation_csv')}`\n")
-
         f.write("\n## Fichiers générés\n")
         f.write(f"- `trips.csv` : par voyage (annulations partielles, incohérences locales)\n")
         f.write(f"- `stop_updates.csv` : chaque STU normalisé\n")
@@ -1013,7 +687,7 @@ def write_reports(analysis: Dict, out_dir: str, pb_path: str, gtfs_path: Optiona
     }
 
 
-# --------------------------------- CLI ---------------------------------------
+# ---------------------------------- CLI -------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Génère un rapport complet à partir d'un fichier GTFS-rt TripUpdates (Protocol Buffer)."
@@ -1025,30 +699,7 @@ def main():
     )
     parser.add_argument("--gtfs", required=False, help="GTFS statique (zip ou dossier) pour validations et comparaison")
     parser.add_argument("--out", required=True, help="Dossier de sortie du rapport")
-    # Nouveaux arguments pour la validation d'annulations
-    parser.add_argument(
-        "--cancellations",
-        required=False,
-        help="CSV d’annulations à valider (colonnes: Trip_id,Start_date,Route_id,Stop_id,Stop_seq)"
-    )
-    parser.add_argument(
-        "--window-start",
-        required=False,
-        help="Début de fenêtre (ISO local ou epoch s). Par défaut: feed.header.timestamp du TripUpdates."
-    )
-    parser.add_argument(
-        "--window-hours",
-        required=False,
-        type=int,
-        default=2,
-        help="Durée de la fenêtre en heures (défaut: 2)."
-    )
-    parser.add_argument(
-        "--tz",
-        required=False,
-        default="America/Montreal",
-        help="Fuseau horaire local à utiliser (défaut: America/Montreal)."
-    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.tripupdates):
@@ -1059,6 +710,7 @@ def main():
         sys.exit(1)
 
     static_gtfs = load_static_gtfs(args.gtfs)
+
     try:
         analysis = analyze_tripupdates(args.tripupdates, static_gtfs)
     except Exception as e:
@@ -1066,28 +718,7 @@ def main():
         print(f" Détail : {e.__class__.__name__}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    validation_outputs = None
-    if args.cancellations:
-        if not os.path.exists(args.cancellations):
-            print(f"💥 Fichier d’annulations introuvable : {args.cancellations}", file=sys.stderr)
-            sys.exit(1)
-        canc_df = pd.read_csv(args.cancellations, dtype={"Trip_id": str, "Route_id": str, "Stop_id": str})
-        val = validate_cancellations_against_tripupdates(
-            cancel_df=canc_df,
-            analysis=analysis,
-            window_start=args.window_start,  # None -> utilise feed.header.timestamp
-            window_hours=args.window_hours,
-            tz=args.tz
-        )
-        # Sauvegarde
-        out_csv = os.path.join(args.out, "cancellations_validation.csv")
-        ensure_dir(args.out)
-        val["results"].to_csv(out_csv, index=False)
-        validation_outputs = {"cancellations_validation_csv": out_csv, "cancellations_summary": val["summary"], "window": {
-            "start_epoch": val["window_start_epoch"], "end_epoch": val["window_end_epoch"], "tz": val["tz"]
-        }}
-
-    outputs = write_reports(analysis, args.out, args.tripupdates, args.gtfs, validation=validation_outputs)
+    outputs = write_reports(analysis, args.out, args.tripupdates, args.gtfs)
     print("✅ Rapport généré :")
     for k, v in outputs.items():
         print(f" - {k}: {v}")
@@ -1095,4 +726,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
