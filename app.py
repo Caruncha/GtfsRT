@@ -38,13 +38,23 @@ with st.sidebar:
 # ------------------------------
 @st.cache_data(show_spinner=False)
 def run_analysis_cached(tu_bytes: bytes, gtfs_bytes: bytes | None):
+    """
+    Exécute l'analyse en environnement temporaire et met en cache le résultat pour
+    ne pas recalculer à chaque rechargement de l'app.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         tu_path = os.path.join(tmpdir, "tripupdates.pb")
         with open(tu_path, "wb") as f:
             f.write(tu_bytes)
 
         gtfs_path = None
-        static_gtfs = {"stops": pd.DataFrame(), "trips": pd.DataFrame(), "stop_times": pd.DataFrame(), "routes": pd.DataFrame(), "agency": pd.DataFrame()}
+        static_gtfs = {
+            "stops": pd.DataFrame(),
+            "trips": pd.DataFrame(),
+            "stop_times": pd.DataFrame(),
+            "routes": pd.DataFrame(),
+            "agency": pd.DataFrame()
+        }
         if gtfs_bytes:
             gtfs_path = os.path.join(tmpdir, "gtfs.zip")
             with open(gtfs_path, "wb") as f:
@@ -54,6 +64,9 @@ def run_analysis_cached(tu_bytes: bytes, gtfs_bytes: bytes | None):
         analysis = analyze_tripupdates(tu_path, static_gtfs)
         return analysis, static_gtfs
 
+# ------------------------------
+# Helpers UI / Data
+# ------------------------------
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
     df.to_csv(buf, index=False)
@@ -68,28 +81,68 @@ def _sr_label_map_trip():
     return {0: "SCHEDULED", 1: "ADDED", 2: "UNSCHEDULED", 3: "CANCELED"}
 
 def _event_epoch_series(stu_df: pd.DataFrame) -> pd.Series:
-    """Choisit l'heure d'événement pour charts (priorise departure_time, sinon arrival_time)."""
+    """
+    Sélectionne l'horodatage d'événement pour les analyses temporelles :
+    priorise departure_time, sinon arrival_time.
+    """
     if stu_df.empty:
         return pd.Series(dtype="float")
     t = stu_df["departure_time"].where(stu_df["departure_time"].notna(), stu_df["arrival_time"])
     return pd.to_numeric(t, errors="coerce")
 
 def _add_local_hour(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
+    """
+    Ajoute 'hour_local' (0..23) selon le fuseau local.
+    (Conservée si tu veux une vue par heure ; non utilisée pour la heatmap 10 min.)
+    """
     s = _event_epoch_series(df)
     if s.empty:
+        df = df.copy()
         df["hour_local"] = pd.NA
         return df
-    # Conversion UTC → tz local
     try:
         dt = pd.to_datetime(s, unit="s", utc=True).dt.tz_convert(ZoneInfo(tz_str))
     except Exception:
         dt = pd.to_datetime(s, unit="s", utc=True)  # fallback UTC
-    df = df.copy()
-    df["hour_local"] = dt.dt.hour
-    return df
+    out = df.copy()
+    out["hour_local"] = dt.dt.hour
+    return out
+
+def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
+    """
+    Ajoute deux colonnes :
+      - bin10_minute : minute depuis minuit locale arrondie à 10 min (0, 10, 20, …, 1430)
+      - bin10_label  : libellé 'HH:MM' de la tranche (08:30, 08:40, …)
+    Priorise departure_time, sinon arrival_time pour l'événement temporel.
+    """
+    s = _event_epoch_series(df)  # série de timestamps (epoch s)
+    out = df.copy()
+    if s.empty:
+        out["bin10_minute"] = pd.NA
+        out["bin10_label"] = pd.NA
+        return out
+
+    # UTC → fuseau local (IANA)
+    try:
+        dt_local = pd.to_datetime(s, unit="s", utc=True).dt.tz_convert(ZoneInfo(tz_str))
+    except Exception:
+        # fallback : reste en UTC si tz invalide
+        dt_local = pd.to_datetime(s, unit="s", utc=True)
+
+    minute_of_day = dt_local.dt.hour * 60 + dt_local.dt.minute
+    bin10 = (minute_of_day // 10) * 10  # arrondi inférieur à 10 min
+
+    out["bin10_minute"] = bin10
+
+    # libellé 'HH:MM'
+    hh = (bin10 // 60).astype(int)
+    mm = (bin10 % 60).astype(int)
+    out["bin10_label"] = hh.map("{:02d}".format) + ":" + mm.map("{:02d}".format)
+
+    return out
 
 def _build_html_report(analysis: dict) -> str:
-    """Construit un petit HTML autonome (texte + tableaux) téléchargeable."""
+    """Construit un HTML autonome (texte + tableaux) téléchargeable."""
     payload = {
         "meta": analysis["meta"],
         "summary": analysis["summary"],
@@ -102,6 +155,7 @@ def _build_html_report(analysis: dict) -> str:
             "schedule_compare_rows": int(len(analysis.get("schedule_compare_df", pd.DataFrame())))
         }
     }
+    # On réutilise la fabrique HTML du module pour rester cohérents
     from gtfsrt_tripupdates_report import _build_summary_html
     return _build_summary_html({
         "meta": payload["meta"],
@@ -168,7 +222,9 @@ if run_button and tu_file is not None:
         trips_view = trips_view[trips_view["trip_id"].fillna("").str.contains(trip_id_query, case=False)]
 
     # Pour filtrer les STU selon route/trip
-    stu_view = stu_df.merge(trips_df[["trip_key", "route_id", "trip_id"]], on="trip_key", how="left", suffixes=("", "_t"))
+    stu_view = stu_df.merge(
+        trips_df[["trip_key", "route_id", "trip_id"]], on="trip_key", how="left", suffixes=("", "_t")
+    )
     if route_sel:
         stu_view = stu_view[stu_view["route_id"].isin(route_sel)]
     if trip_id_query:
@@ -184,6 +240,7 @@ if run_button and tu_file is not None:
     added_trips = int((trips_view["trip_schedule_relationship"] == 1).sum())     # ADDED
     unscheduled_trips = int((trips_view["trip_schedule_relationship"] == 2).sum())  # UNSCHEDULED
 
+    # Partially canceled = trips avec ≥1 SKIPPED mais pas CANCELED
     sk = stu_view[stu_view["stu_schedule_relationship"] == 1]  # SKIPPED
     trips_with_sk = set(sk["trip_key"]) if not sk.empty else set()
     fully_canceled = set(trips_view.loc[trips_view["trip_schedule_relationship"] == 3, "trip_key"])
@@ -240,7 +297,12 @@ if run_button and tu_file is not None:
     # ------------------ Top 20 arrêts annulés ------------------
     st.markdown("### Top 20 des arrêts annulés (SKIPPED)")
     if not sk.empty:
-        top_sk = sk.groupby("stop_id").size().reset_index(name="compte").sort_values("compte", ascending=False).head(20)
+        top_sk = (
+            sk.groupby("stop_id")
+            .size().reset_index(name="compte")
+            .sort_values("compte", ascending=False)
+            .head(20)
+        )
         # Ajoute stop_name si disponible
         stops_static = static_gtfs.get("stops", pd.DataFrame())
         if not stops_static.empty and "stop_name" in stops_static.columns:
@@ -260,33 +322,48 @@ if run_button and tu_file is not None:
     else:
         st.info("Aucun arrêt annulé dans la sélection.")
 
-    # ------------------ Heatmap par heure locale ------------------
-    st.markdown("### Heatmap par heure locale et type d'arrêt")
+    # ------------------ Heatmap par tranches de 10 minutes ------------------
+    st.markdown("### Heatmap par tranches de 10 minutes et type de passage")
     if not stu_view.empty:
         try:
-            stu_hour = _add_local_hour(stu_view, tz_input)
+            # Ajoute les tranches 10 min locales
+            stu_10 = _add_local_bin10(stu_view, tz_input)
         except Exception:
-            stu_hour = _add_local_hour(stu_view, "UTC")
-        dist_hour = (
-            stu_hour.assign(type=lambda d: d["stu_schedule_relationship"].map(_sr_label_map_stu()).fillna("AUTRE"))
-            .dropna(subset=["hour_local"])
-            .groupby(["hour_local", "type"]).size().reset_index(name="compte")
+            stu_10 = _add_local_bin10(stu_view, "UTC")
+
+        # Map du type lisible
+        stu_10 = stu_10.assign(
+            type=lambda d: d["stu_schedule_relationship"].map(_sr_label_map_stu()).fillna("AUTRE")
         )
-        if not dist_hour.empty:
-            heat = (
-                alt.Chart(dist_hour)
+
+        # Agrégation par (tranche 10 min, type)
+        dist_10 = (
+            stu_10
+            .dropna(subset=["bin10_minute"])
+            .groupby(["bin10_minute", "bin10_label", "type"])
+            .size()
+            .reset_index(name="compte")
+            .sort_values(["bin10_minute", "type"])
+        )
+
+        if not dist_10.empty:
+            heat10 = (
+                alt.Chart(dist_10)
                 .mark_rect()
                 .encode(
-                    x=alt.X("hour_local:O", title="Heure locale (0–23)"),
-                    y=alt.Y("type:N", title="Type d'arrêt"),
+                    # Trie X par la valeur numérique de la tranche (évite l'ordre alpha '01:00' vs '10:00')
+                    x=alt.X("bin10_label:N",
+                            sort=alt.SortField(field="bin10_minute", order="ascending"),
+                            title="Heure locale (tranches de 10 min)"),
+                    y=alt.Y("type:N", title="Type de passage"),
                     color=alt.Color("compte:Q", title="Compte", scale=alt.Scale(scheme="blues")),
-                    tooltip=["hour_local", "type", "compte"]
+                    tooltip=["bin10_label", "type", "compte"]
                 )
-                .properties(height=300)
+                .properties(height=320)
             )
-            st.altair_chart(heat, use_container_width=True)
+            st.altair_chart(heat10, use_container_width=True)
         else:
-            st.info("Pas de données temporelles suffisantes pour la heatmap.")
+            st.info("Pas de données suffisantes pour la heatmap en tranches de 10 minutes.")
     else:
         st.info("Aucun STU à représenter pour la heatmap.")
 
