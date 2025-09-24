@@ -15,20 +15,15 @@ from gtfsrt_tripupdates_report import (
     load_static_gtfs,
 )
 
-# Altair : enlève la limite 5k lignes pour éviter MaxRowsError
+# Altair : retire la limite 5k lignes pour éviter MaxRowsError
 alt.data_transformers.enable('default', max_rows=None)
 
 st.set_page_config(page_title="🚌 Analyseur TripUpdates", layout="wide")
 
-# Watcher : évite inotify 'watch limit reached' (Streamlit Cloud / containers)
-st.set_option("server.fileWatcherType", "poll")
-# Optionnel : désactiver le relance auto sur sauvegarde
-# st.set_option("server.runOnSave", False)
-
 st.title("🚌 Analyseur GTFS‑realtime : TripUpdates")
 st.write(
-    "Charge un fichier **TripUpdates (Protocol Buffer)** (extension libre) et, optionnellement, un **GTFS statique** pour des validations avancées et la comparaison au planifié. "
-    "Utilise les filtres pour explorer, et télécharge les résultats."
+    "Charge un fichier **TripUpdates (Protocol Buffer)** (extension libre) et, optionnellement, un **GTFS statique** "
+    "pour des validations avancées et la comparaison au planifié. Utilise les filtres pour explorer, et télécharge les résultats."
 )
 
 # ------------------------------
@@ -97,8 +92,7 @@ def _sr_label_map_trip():
 
 def _event_epoch_series(stu_df: pd.DataFrame) -> pd.Series:
     """
-    Sélectionne l'horodatage d'événement pour les analyses temporelles :
-    priorise departure_time, sinon arrival_time.
+    Horodatage d’événement pour l’axe temps : priorise departure_time, sinon arrival_time.
     """
     if stu_df.empty:
         return pd.Series(dtype="float")
@@ -110,7 +104,6 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     Ajoute :
       - bin10_minute (Int64) : minute depuis minuit locale arrondie à 10 min (0..1430)
       - bin10_label  (string): libellé 'HH:MM' de la tranche
-    Priorise departure_time, sinon arrival_time pour l'événement temporel.
     """
     s = _event_epoch_series(df)
     out = df.copy()
@@ -131,7 +124,7 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     out["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
     return out
 
-# --- Helpers pour binning des voyages (annulations) ---
+# --- Helpers annulations (10 min) ---
 def _hms_to_seconds(hms: str) -> int | None:
     if hms is None or pd.isna(hms):
         return None
@@ -153,18 +146,13 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
                                      stu_view: pd.DataFrame,
                                      tz_str: str) -> pd.DataFrame:
     """
-    Retourne colonnes:
-      - bin10_minute (Int64), bin10_label (string)
-      - kind in {"Annulations complètes", "Annulations partielles"}
-      - compte
-    Binning 10 min basé sur :
-      - min(event_time) par trip (dep/arr STU), sinon
-      - start_date + start_time (si présents)
+    Retourne colonnes: bin10_minute (Int64), bin10_label (string), kind {"Annulations complètes","Annulations partielles"}, compte
+    Binning 10 min basé sur : min(event_time) par trip (dep/arr STU), sinon start_date+start_time.
     """
     if trips_view.empty:
         return pd.DataFrame(columns=["bin10_minute", "bin10_label", "kind", "compte"])
 
-    # 1) Timestamps d'événement au niveau trip (min des STU par trip_key)
+    # min(event_time) par trip_key
     if not stu_view.empty:
         sv = stu_view.copy()
         sv["event_time"] = sv["departure_time"].where(sv["departure_time"].notna(), sv["arrival_time"])
@@ -179,7 +167,7 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
 
     tv = trips_view.copy().merge(per_trip_event, left_on="trip_key", right_index=True, how="left")
 
-    # 2) Fallback : start_date + start_time
+    # fallback start_date + start_time
     missing_event = tv["trip_event_epoch"].isna()
     if "start_date" in tv.columns and "start_time" in tv.columns:
         midnight_epoch = tv.loc[missing_event, "start_date"].apply(
@@ -191,7 +179,7 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
             fallback_epoch.append(None if me is None or ss is None else me + ss)
         tv.loc[missing_event, "trip_event_epoch"] = pd.to_numeric(pd.Series(fallback_epoch), errors="coerce")
 
-    # 3) Conversion epoch → local, bin 10 min
+    # epoch → local → bin 10 min
     dt_local = pd.to_datetime(tv["trip_event_epoch"], unit="s", utc=True, errors="coerce")
     try:
         dt_local = dt_local.dt.tz_convert(ZoneInfo(tz_str))
@@ -202,7 +190,7 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
     tv["bin10_minute"] = pd.to_numeric(dt10.dt.hour * 60 + dt10.dt.minute, errors="coerce").astype("Int64")
     tv["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
 
-    # 4) Détermination des types d'annulation
+    # jeux d'annulation
     fully_canceled_keys = set(tv.loc[tv["trip_schedule_relationship"] == 3, "trip_key"])
     if not stu_view.empty:
         skipped_keys = set(stu_view.loc[stu_view["stu_schedule_relationship"] == 1, "trip_key"])
@@ -210,24 +198,20 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame,
         skipped_keys = set()
     partial_keys = skipped_keys - fully_canceled_keys
 
-    # 5) Agrégation par 10 min
     tv_non_na = tv.dropna(subset=["bin10_minute"])
     series_full = tv_non_na.loc[tv_non_na["trip_key"].isin(fully_canceled_keys)] \
                            .groupby(["bin10_minute", "bin10_label"]).size().rename("compte")
     series_part = tv_non_na.loc[tv_non_na["trip_key"].isin(partial_keys)] \
                            .groupby(["bin10_minute", "bin10_label"]).size().rename("compte")
 
-    # 6) Mise en forme longue
     df_full = series_full.reset_index(); df_full["kind"] = "Annulations complètes"
     df_part = series_part.reset_index(); df_part["kind"] = "Annulations partielles"
     out = pd.concat([df_full, df_part], ignore_index=True, sort=False) if not df_full.empty or not df_part.empty \
           else pd.DataFrame(columns=["bin10_minute", "bin10_label", "compte", "kind"])
 
-    # Ordonne correctement l'axe X par la valeur numérique
-    out = out.sort_values(["bin10_minute", "kind"])
-    return out[["bin10_minute", "bin10_label", "kind", "compte"]]
+    return out.sort_values(["bin10_minute", "kind"])[["bin10_minute", "bin10_label", "kind", "compte"]]
 
-# --- Histogrammes robustes (évite overflows NumPy) ---
+# --- Histogrammes robustes (anti-overflow) ---
 def _safe_histogram(series: pd.Series, bins: int = 60, clip_abs_minutes: int | None = 1440) -> pd.DataFrame:
     """
     Convertit en float64, retire NaN/Inf, clippe les extrêmes (±clip_abs_minutes),
@@ -282,11 +266,9 @@ if run_button and tu_file is not None:
     # ------------------ Filtres ------------------
     st.sidebar.header("Filtres")
 
-    # Options route_id
     route_opts = sorted([r for r in trips_df["route_id"].dropna().unique().tolist() if r != ""])
     route_sel = st.sidebar.multiselect("Filtrer par route_id", options=route_opts, default=[])
 
-    # TripDescriptor schedule_relationship
     map_trip = _sr_label_map_trip()
     trip_types = [(0, "SCHEDULED"), (1, "ADDED"), (2, "UNSCHEDULED"), (3, "CANCELED")]
     trip_sel_labels = st.sidebar.multiselect(
@@ -294,7 +276,6 @@ if run_button and tu_file is not None:
     )
     trip_sel_ids = {k for k, v in trip_types if v in set(trip_sel_labels)}
 
-    # StopTimeUpdate schedule_relationship
     map_stu = _sr_label_map_stu()
     stu_types = [(0, "SCHEDULED"), (1, "SKIPPED"), (2, "NO_DATA")]
     stu_sel_labels = st.sidebar.multiselect(
@@ -304,7 +285,6 @@ if run_button and tu_file is not None:
 
     trip_id_query = st.sidebar.text_input("Recherche trip_id (contient)", value="")
 
-    # Applique filtres
     trips_view = trips_df.copy()
     if route_sel:
         trips_view = trips_view[trips_view["route_id"].isin(route_sel)]
@@ -313,10 +293,7 @@ if run_button and tu_file is not None:
     if trip_id_query:
         trips_view = trips_view[trips_view["trip_id"].fillna("").str.contains(trip_id_query, case=False)]
 
-    # Pour filtrer les STU selon route/trip
-    stu_view = stu_df.merge(
-        trips_df[["trip_key", "route_id", "trip_id"]], on="trip_key", how="left", suffixes=("", "_t")
-    )
+    stu_view = stu_df.merge(trips_df[["trip_key", "route_id", "trip_id"]], on="trip_key", how="left", suffixes=("", "_t"))
     if route_sel:
         stu_view = stu_view[stu_view["route_id"].isin(route_sel)]
     if trip_id_query:
@@ -328,11 +305,10 @@ if run_button and tu_file is not None:
     st.subheader("Résumé")
     col1, col2, col3, col4, col5 = st.columns(5)
     total_trips = int(trips_view["trip_key"].nunique())
-    canceled_trips = int((trips_view["trip_schedule_relationship"] == 3).sum())  # CANCELED
-    added_trips = int((trips_view["trip_schedule_relationship"] == 1).sum())     # ADDED
-    unscheduled_trips = int((trips_view["trip_schedule_relationship"] == 2).sum())  # UNSCHEDULED
+    canceled_trips = int((trips_view["trip_schedule_relationship"] == 3).sum())
+    added_trips = int((trips_view["trip_schedule_relationship"] == 1).sum())
+    unscheduled_trips = int((trips_view["trip_schedule_relationship"] == 2).sum())
 
-    # Partially canceled = trips avec ≥1 SKIPPED mais pas CANCELED
     sk = stu_view[stu_view["stu_schedule_relationship"] == 1]  # SKIPPED
     trips_with_sk = set(sk["trip_key"]) if not sk.empty else set()
     fully_canceled = set(trips_view.loc[trips_view["trip_schedule_relationship"] == 3, "trip_key"])
@@ -450,12 +426,10 @@ if run_button and tu_file is not None:
     sk_only = stu_view[stu_view["stu_schedule_relationship"] == 1]
     if not sk_only.empty:
         top_sk = (
-            sk_only.groupby("stop_id")
-            .size().reset_index(name="compte")
-            .sort_values("compte", ascending=False)
-            .head(20)
+            sk_only.groupby("stop_id").size().reset_index(name="compte")
+                  .sort_values("compte", ascending=False)
+                  .head(20)
         )
-        # stop_name si dispo dans le GTFS statique
         stops_static = static_gtfs.get("stops", pd.DataFrame())
         if not stops_static.empty and "stop_name" in stops_static.columns:
             top_sk = top_sk.merge(stops_static[["stop_id", "stop_name"]], on="stop_id", how="left")
