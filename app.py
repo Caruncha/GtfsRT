@@ -76,6 +76,24 @@ def run_analysis_cached(tu_bytes: bytes, gtfs_bytes: Optional[bytes]):
 # -----------------------------------------------------------------------------
 # Helpers UI / Data
 # -----------------------------------------------------------------------------
+# --- Helpers carte / couleurs -------------------------------------------------
+def _normalize_hex_color(s: str, default: str = "#888888") -> str:
+    """
+    Normalise une couleur hex GTFS en '#RRGGBB'.
+    - Accepte 'RRGGBB', '#RRGGBB', 'RGB' ; sinon fallback default.
+    """
+    if s is None or pd.isna(s):
+        return default
+    t = str(s).strip().lstrip("#")
+    if not t:
+        return default
+    if len(t) == 3 and all(c in "0123456789abcdefABCDEF" for c in t):
+        t = "".join(ch * 2 for ch in t)
+    t = t.upper()
+    if len(t) >= 6 and all(c in "0123456789ABCDEF" for c in t[:6]):
+        return "#" + t[:6]
+    return default
+    
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
     df.to_csv(buf, index=False)
@@ -489,6 +507,142 @@ if run_button and tu_file is not None:
         st.altair_chart(chart_top, use_container_width=True)
     else:
         st.info("Aucun arrêt annulé dans la sélection.")
+    # -----------------------------------------------------------------------------
+# Carte des trajets (Altair)
+# -----------------------------------------------------------------------------
+st.markdown("### 🗺️ Carte des trajets (Altair)")
+
+stops_static = static_gtfs.get("stops", pd.DataFrame())
+stop_times_static = static_gtfs.get("stop_times", pd.DataFrame())
+trips_static = static_gtfs.get("trips", pd.DataFrame())
+routes_static = static_gtfs.get("routes", pd.DataFrame())
+
+# Vérifications minimales
+missing_bits = []
+if stops_static.empty or not {"stop_id", "stop_lat", "stop_lon"}.issubset(stops_static.columns):
+    missing_bits.append("`stops.txt` avec `stop_lat/stop_lon`")
+if stop_times_static.empty or not {"trip_id", "stop_id", "stop_sequence"}.issubset(stop_times_static.columns):
+    missing_bits.append("`stop_times.txt` (trip_id, stop_id, stop_sequence)")
+if trips_static.empty or "route_id" not in trips_static.columns:
+    missing_bits.append("`trips.txt` (trip_id, route_id)")
+if routes_static.empty or "route_id" not in routes_static.columns:
+    missing_bits.append("`routes.txt`")
+if missing_bits:
+    st.info("Carte indisponible : " + " ; ".join(missing_bits))
+else:
+    # Options UI
+    # On propose les trip_id disponibles après filtres
+    trip_opts = sorted([t for t in trips_view["trip_id"].dropna().unique().tolist() if t != ""])
+    default_selection = trip_opts[:5]  # limite par défaut pour éviter les gros rendus
+    trip_sel = st.multiselect(
+        "Trip_id à cartographier",
+        options=trip_opts,
+        default=default_selection,
+        help="Sélectionne un ou plusieurs voyages à tracer sur la carte."
+    )
+    max_trips = st.slider("Nombre maximal de trips représentés", 1, 50, max(1, len(trip_sel) or 5))
+    if trip_sel:
+        trip_sel = trip_sel[:max_trips]
+
+    if not trip_sel:
+        st.info("Sélectionne au moins un `trip_id` pour afficher la carte.")
+    else:
+        # Prépare les chemins: stop_times -> stops (coords) -> trips (route) -> route_color
+        paths = (
+            stop_times_static[stop_times_static["trip_id"].isin(trip_sel)]
+            .merge(stops_static[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
+            .merge(trips_static[["trip_id", "route_id"]], on="trip_id", how="left")
+            .merge(routes_static[["route_id", "route_color"]], on="route_id", how="left")
+        )
+
+        # Nettoyage / types
+        # ordre des points, coords valides
+        paths = paths.dropna(subset=["stop_lat", "stop_lon"])
+        # normalise couleurs
+        paths["route_color"] = paths.get("route_color", pd.Series([], dtype="object")).apply(
+            lambda v: _normalize_hex_color(v, default="#4C78A8")  # bleu clair par défaut
+        )
+
+        # Points annulés (SKIPPED) depuis le RT pour les trips sélectionnés
+        sk_points = pd.DataFrame(columns=["trip_id", "stop_id", "stop_lat", "stop_lon", "stop_sequence"])
+        if not stu_view.empty and "stu_schedule_relationship" in stu_view.columns:
+            sk = stu_view[
+                (stu_view["trip_id"].isin(trip_sel)) &
+                (stu_view["stu_schedule_relationship"] == 1)  # 1 == SKIPPED
+            ].copy()
+            if not sk.empty:
+                # Pour placer le point, on merge sur stops pour récupérer lat/lon
+                sk_points = sk.merge(stops_static[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
+                # On tente d'ajouter stop_sequence (si absent côté STU)
+                if "stop_sequence" not in sk_points.columns or sk_points["stop_sequence"].isna().all():
+                    sk_points = sk_points.merge(
+                        stop_times_static[["trip_id", "stop_id", "stop_sequence"]],
+                        on=["trip_id", "stop_id"],
+                        how="left",
+                        suffixes=("", "_sched")
+                    )
+
+        # Construit les couches Altair
+        base = alt.Chart(paths).project("mercator").properties(height=520)
+
+        # Lignes de parcours, colorées par route_color (couleur directe, pas d'échelle)
+        lines = (
+            base
+            .mark_line(strokeWidth=2, opacity=0.85)
+            .encode(
+                longitude="stop_lon:Q",
+                latitude="stop_lat:Q",
+                detail="trip_id:N",
+                order="stop_sequence:Q",
+                color=alt.Color("route_color:N", scale=None, legend=None),
+                tooltip=[
+                    alt.Tooltip("trip_id:N", title="Trip"),
+                    alt.Tooltip("route_id:N", title="Route"),
+                    alt.Tooltip("stop_id:N", title="Arrêt"),
+                    alt.Tooltip("stop_sequence:Q", title="Ordre")
+                ]
+            )
+        )
+
+        # (Optionnel) petits points gris pour tous les arrêts tracés (contexte)
+        points_all = (
+            base
+            .mark_point(filled=True, color="#999999", size=20, opacity=0.6)
+            .encode(
+                longitude="stop_lon:Q",
+                latitude="stop_lat:Q",
+                tooltip=[
+                    alt.Tooltip("trip_id:N", title="Trip"),
+                    alt.Tooltip("stop_id:N", title="Arrêt"),
+                    alt.Tooltip("stop_sequence:Q", title="Ordre")
+                ]
+            )
+        )
+
+        # Points rouges pour SKIPPED
+        layer_sk = None
+        if not sk_points.empty:
+            layer_sk = (
+                alt.Chart(sk_points)
+                .project("mercator")
+                .mark_point(filled=True, color="#E45756", size=90, opacity=0.95)
+                .encode(
+                    longitude="stop_lon:Q",
+                    latitude="stop_lat:Q",
+                    tooltip=[
+                        alt.Tooltip("trip_id:N", title="Trip"),
+                        alt.Tooltip("stop_id:N", title="Arrêt (SKIPPED)"),
+                        alt.Tooltip("stop_sequence:Q", title="Ordre")
+                    ]
+                )
+            )
+
+        # Assemble la carte
+        chart_map = lines + points_all
+        if layer_sk is not None:
+            chart_map = chart_map + layer_sk
+
+        st.altair_chart(chart_map.interactive(), use_container_width=True)
 
     # ------------------------------ Comparaison au planifié (si GTFS fourni)
     st.markdown("### Écart vs horaire planifié (si GTFS fourni)")
@@ -692,3 +846,4 @@ if run_button and tu_file is not None:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
+
