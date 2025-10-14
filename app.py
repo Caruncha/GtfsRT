@@ -1,3 +1,4 @@
+# ==== START OF FILE app.py ====
 # -*- coding: utf-8 -*-
 import os
 import io
@@ -57,7 +58,6 @@ def run_analysis_cached(tu_bytes: bytes, gtfs_bytes: Optional[bytes]):
         with open(tu_path, "wb") as f:
             f.write(tu_bytes)
 
-        gtfs_path = None
         static_gtfs = {
             "stops": pd.DataFrame(),
             "trips": pd.DataFrame(),
@@ -73,7 +73,6 @@ def run_analysis_cached(tu_bytes: bytes, gtfs_bytes: Optional[bytes]):
 
         analysis = analyze_tripupdates(tu_path, static_gtfs)
         return analysis, static_gtfs
-
 # -----------------------------------------------------------------------------
 # Helpers UI / Data
 # -----------------------------------------------------------------------------
@@ -121,6 +120,7 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     out["bin10_minute"] = pd.to_numeric(minute_of_day, errors="coerce").astype("Int64")
     out["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
     return out
+
 # --- Helpers annulations (10 min) ---
 def _hms_to_seconds(hms: Optional[str]) -> Optional[int]:
     if hms is None or pd.isna(hms):
@@ -316,13 +316,11 @@ if run_button and tu_file is not None:
     st.sidebar.header("Filtres")
     route_opts = sorted([r for r in trips_df["route_id"].dropna().unique().tolist() if r != ""])
     route_sel = st.sidebar.multiselect("Filtrer par route_id", options=route_opts, default=[])
-    map_trip = _sr_label_map_trip()
     trip_types = [(0, "SCHEDULED"), (1, "ADDED"), (2, "UNSCHEDULED"), (3, "CANCELED")]
     trip_sel_labels = st.sidebar.multiselect(
         "Types de voyages", options=[lbl for _, lbl in trip_types], default=[lbl for _, lbl in trip_types]
     )
     trip_sel_ids = {k for k, v in trip_types if v in set(trip_sel_labels)}
-    map_stu = _sr_label_map_stu()
     stu_types = [(0, "SCHEDULED"), (1, "SKIPPED"), (2, "NO_DATA")]
     stu_sel_labels = st.sidebar.multiselect(
         "Types d'arrêts (STU)", options=[lbl for _, lbl in stu_types], default=[lbl for _, lbl in stu_types]
@@ -347,12 +345,12 @@ if run_button and tu_file is not None:
     if route_sel:
         stu_view = stu_view[stu_view["route_id"].isin(route_sel)]
     if trip_id_query:
-        # après merge, le trip_id original peut être suffixé _t ; on filtre sur les deux si existants
+        # après merge, la vraie colonne trip_id peut être suffixée _t ; on filtre sur les deux si existants
         col_candidates = [c for c in ["trip_id", "trip_id_t"] if c in stu_view.columns]
         if col_candidates:
-            mask = False
+            mask = pd.Series(False, index=stu_view.index)
             for c in col_candidates:
-                mask = (mask | stu_view[c].fillna("").str.contains(trip_id_query, case=False))
+                mask = mask | stu_view[c].fillna("").str.contains(trip_id_query, case=False)
             stu_view = stu_view[mask]
     if stu_sel_ids:
         stu_view = stu_view[stu_view["stu_schedule_relationship"].isin(stu_sel_ids)]
@@ -378,7 +376,7 @@ if run_button and tu_file is not None:
     col5.metric("Voyages partiellement annulés", f"{partial_canceled_trips:,}".replace(",", " "))
 
     # ----------------------------- Graphiques récapitulatifs
-    st.markdown("### ### Graphiques récapitulatifs")
+    st.markdown("### Graphiques récapitulatifs")
     charts_col1, charts_col2 = st.columns(2)
     with charts_col1:
         summary_counts = pd.DataFrame([
@@ -462,7 +460,6 @@ if run_button and tu_file is not None:
 
             paths = paths.dropna(subset=["stop_lat", "stop_lon"])
             if "stop_sequence" in paths.columns:
-                # s'assure que l'ordre est numérique pour le tracé
                 paths["stop_sequence"] = pd.to_numeric(paths["stop_sequence"], errors="coerce")
             paths["route_color"] = paths.get("route_color", pd.Series([], dtype="object")).apply(
                 lambda v: _normalize_hex_color(v, default="#4C78A8")
@@ -545,7 +542,7 @@ if run_button and tu_file is not None:
             st.altair_chart(chart_map.interactive(), use_container_width=True)
 
     # ----------------------------- Courbe des passages (10 min)
-    st.markdown("### ### Courbe — Passages par tranches de 10 minutes (par type d'arrêt)")
+    st.markdown("### Courbe — Passages par tranches de 10 minutes (par type d'arrêt)")
     if not stu_view.empty:
         try:
             stu_10 = _add_local_bin10(stu_view, tz_input)
@@ -582,7 +579,7 @@ if run_button and tu_file is not None:
         st.info("Aucun STU à représenter pour la courbe des passages.")
 
     # ----------------------------- Courbes des annulations de voyages (10 min)
-    st.markdown("### ### Courbes — Annulations de voyages (complètes vs partielles, 10 min)")
+    st.markdown("### Courbes — Annulations de voyages (complètes vs partielles, 10 min)")
     series_cancel = _trips_binning_for_cancellations(trips_view, stu_view, tz_input)
     if not series_cancel.empty:
         line_cancel = (
@@ -604,7 +601,7 @@ if run_button and tu_file is not None:
         st.info("Pas de voyages annulés (complets ou partiels) dans la sélection.")
 
     # ----------------------------- Top 20 arrêts annulés
-    st.markdown("### ### Top 20 des arrêts annulés (SKIPPED)")
+    st.markdown("### Top 20 des arrêts annulés (SKIPPED)")
     sk_only = stu_view[stu_view["stu_schedule_relationship"] == 1]
     if not sk_only.empty:
         top_sk = (
@@ -634,7 +631,7 @@ if run_button and tu_file is not None:
         st.info("Aucun arrêt annulé dans la sélection.")
 
     # ----------------------------- Comparaison au planifié (si GTFS fourni)
-    st.markdown("### ### Écart vs horaire planifié (si GTFS fourni)")
+    st.markdown("### Écart vs horaire planifié (si GTFS fourni)")
     if not sched_df.empty and schedule_stats:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Lignes comparées", f"{schedule_stats.get('rows_compared', 0):,}".replace(",", " "))
@@ -694,7 +691,7 @@ if run_button and tu_file is not None:
     st.divider()
 
     # ----------------------------- Validation CSV d’annulations (fenêtre 2 h)
-    st.markdown("### ### Valider un fichier d’annulations (fenêtre 2 h)")
+    st.markdown("### Valider un fichier d’annulations (fenêtre 2 h)")
     with st.expander("Ajouter un CSV d’annulations et valider sur une fenêtre temporelle"):
         canc_file = st.file_uploader(
             "Fichier d’annulations (CSV) — colonnes: Trip_id,Start_date,Route_id,Stop_id,Stop_seq",
@@ -757,7 +754,7 @@ if run_button and tu_file is not None:
     st.divider()
 
     # ----------------------------- Détails JSON
-    st.markdown("### ### Détails (JSON)")
+    st.markdown("### Détails (JSON)")
     st.json({
         "meta": analysis["meta"],
         "summary": analysis["summary"],
@@ -771,7 +768,7 @@ if run_button and tu_file is not None:
     })
 
     # ----------------------------- Téléchargements
-    st.markdown("### ### Téléchargements")
+    st.markdown("### Téléchargements")
     cdl1, cdl2, cdl3, cdl4 = st.columns(4)
     with cdl1:
         st.download_button("⬇️ trips.csv", _to_csv_bytes(trips_df), "trips.csv", mime="text/csv")
@@ -800,7 +797,7 @@ if run_button and tu_file is not None:
         )
 
     # ----------------------------- Tables
-    st.markdown("### ### Tables")
+    st.markdown("### Tables")
     show_trips, show_stu, show_anom = st.columns(3)
     with show_trips:
         show_trips_flag = st.checkbox("Afficher trips.csv", value=True)
@@ -834,4 +831,4 @@ if run_button and tu_file is not None:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
-``
+# ==== END OF FILE app.py ====
