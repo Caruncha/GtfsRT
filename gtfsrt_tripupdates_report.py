@@ -723,6 +723,56 @@ def analyze_tripupdates(pb_path: str, static_gtfs: Dict[str, pd.DataFrame]):
                 stu_df[col] = stu_df[col].apply(lambda v: int(round(v/1000)) if pd.notna(v) else v)
         corrected = True
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Fallback start_time depuis le GTFS statique :
+    #  - prend l'arrivée au premier arrêt (stop_sequence min) d'un trip_id,
+    #    et si l'arrivée est vide, on replie sur departure_time.
+    #  - n'écrase PAS une start_time GTFS-rt existante.
+    # ─────────────────────────────────────────────────────────────────────────
+    try:
+        st_static = static_gtfs.get("stop_times", pd.DataFrame())
+        if not st_static.empty and not trips_df.empty:
+            # Colonnes attendues : trip_id, stop_sequence, arrival_time, departure_time
+            cols_needed = {"trip_id", "stop_sequence", "arrival_time", "departure_time"}
+            if cols_needed.issubset(set(st_static.columns)):
+                st_sorted = st_static.sort_values("stop_sequence", ascending=True)
+                first_per_trip = st_sorted.groupby("trip_id", as_index=False).first()
+
+                # Fallback string HH:MM:SS (peut dépasser 24h, conforme GTFS)
+                first_per_trip["fallback_start_time"] = first_per_trip["arrival_time"]
+                mask_arr_na = first_per_trip["fallback_start_time"].isna() | (first_per_trip["fallback_start_time"] == "")
+                first_per_trip.loc[mask_arr_na, "fallback_start_time"] = first_per_trip.loc[mask_arr_na, "departure_time"]
+
+                # Map trip_id → fallback_start_time (string)
+                fallback_map = dict(
+                    zip(
+                        first_per_trip["trip_id"].astype(str),
+                        first_per_trip["fallback_start_time"].astype("string")
+                    )
+                )
+
+                # Remplit trips_df.start_time si vide
+                if "start_time" not in trips_df.columns:
+                    trips_df["start_time"] = ""
+                mask_trips_empty = trips_df["start_time"].isna() | (trips_df["start_time"] == "")
+                trips_df.loc[mask_trips_empty, "start_time"] = (
+                    trips_df.loc[mask_trips_empty, "trip_id"].map(fallback_map).fillna(trips_df.loc[mask_trips_empty, "start_time"])
+                )
+                trips_df["start_time"] = trips_df["start_time"].fillna("").astype("string")
+
+                # Remplit aussi stu_df.start_time si vide (utile pour certaines vues/exports)
+                if not stu_df.empty:
+                    if "start_time" not in stu_df.columns:
+                        stu_df["start_time"] = ""
+                    mask_stu_empty = stu_df["start_time"].isna() | (stu_df["start_time"] == "")
+                    stu_df.loc[mask_stu_empty, "start_time"] = (
+                        stu_df.loc[mask_stu_empty, "trip_id"].map(fallback_map).fillna(stu_df.loc[mask_stu_empty, "start_time"])
+                    )
+                    stu_df["start_time"] = stu_df["start_time"].fillna("").astype("string")
+    except Exception:
+        # N'échoue pas l'analyse si un GTFS exotique pose problème ; on continue sans fallback.
+        pass
+      
     # Comparaison au planifié (si GTFS statique dispo)
     if static_gtfs["stop_times"].empty:
         schedule_compare_df, schedule_stats = pd.DataFrame(), {}
@@ -1021,3 +1071,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
