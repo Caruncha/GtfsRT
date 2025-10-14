@@ -37,6 +37,7 @@ with st.sidebar:
         type=None  # accepte tout
     )
     gtfs_file = st.file_uploader("GTFS statique (zip) (optionnel)", type=["zip"])
+
     st.divider()
     st.header("Options")
     st.caption("Astuce : pour de gros fichiers, augmentez la taille via `.streamlit/config.toml` → [server] maxUploadSize = 200")
@@ -76,24 +77,6 @@ def run_analysis_cached(tu_bytes: bytes, gtfs_bytes: Optional[bytes]):
 # -----------------------------------------------------------------------------
 # Helpers UI / Data
 # -----------------------------------------------------------------------------
-# --- Helpers carte / couleurs -------------------------------------------------
-def _normalize_hex_color(s: str, default: str = "#888888") -> str:
-    """
-    Normalise une couleur hex GTFS en '#RRGGBB'.
-    - Accepte 'RRGGBB', '#RRGGBB', 'RGB' ; sinon fallback default.
-    """
-    if s is None or pd.isna(s):
-        return default
-    t = str(s).strip().lstrip("#")
-    if not t:
-        return default
-    if len(t) == 3 and all(c in "0123456789abcdefABCDEF" for c in t):
-        t = "".join(ch * 2 for ch in t)
-    t = t.upper()
-    if len(t) >= 6 and all(c in "0123456789ABCDEF" for c in t[:6]):
-        return "#" + t[:6]
-    return default
-    
 def _to_csv_bytes(df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
     df.to_csv(buf, index=False)
@@ -128,6 +111,7 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
         out["bin10_minute"] = pd.Series([pd.NA] * len(out), dtype="Int64")
         out["bin10_label"] = pd.Series([pd.NA] * len(out), dtype="string")
         return out
+
     try:
         dt_local = pd.to_datetime(s, unit="s", utc=True).dt.tz_convert(ZoneInfo(tz_str))
     except Exception:
@@ -137,7 +121,6 @@ def _add_local_bin10(df: pd.DataFrame, tz_str: str) -> pd.DataFrame:
     out["bin10_minute"] = pd.to_numeric(minute_of_day, errors="coerce").astype("Int64")
     out["bin10_label"] = dt10.dt.strftime("%H:%M").astype("string")
     return out
-
 # --- Helpers annulations (10 min) ---
 def _hms_to_seconds(hms: Optional[str]) -> Optional[int]:
     if hms is None or pd.isna(hms):
@@ -212,15 +195,15 @@ def _trips_binning_for_cancellations(trips_view: pd.DataFrame, stu_view: pd.Data
     tv_non_na = tv.dropna(subset=["bin10_minute"])
     series_full = (
         tv_non_na.loc[tv_non_na["trip_key"].isin(fully_canceled_keys)]
-        .groupby(["bin10_minute", "bin10_label"]).size().rename("compte")
+              .groupby(["bin10_minute", "bin10_label"]).size().rename("compte")
     )
     series_part = (
         tv_non_na.loc[tv_non_na["trip_key"].isin(partial_keys)]
-        .groupby(["bin10_minute", "bin10_label"]).size().rename("compte")
+              .groupby(["bin10_minute", "bin10_label"]).size().rename("compte")
     )
-
     df_full = series_full.reset_index(); df_full["kind"] = "Annulations complètes"
     df_part = series_part.reset_index(); df_part["kind"] = "Annulations partielles"
+
     if not df_full.empty or not df_part.empty:
         out = pd.concat([df_full, df_part], ignore_index=True, sort=False)
     else:
@@ -257,6 +240,24 @@ def _ensure_min_schema(df: pd.DataFrame, required: Dict[str, str]) -> pd.DataFra
             except Exception:
                 out[col] = pd.Series([], dtype="object")
     return out
+
+# --- Helper couleurs (carte) ---
+def _normalize_hex_color(s: str, default: str = "#888888") -> str:
+    """
+    Normalise une couleur hex GTFS en '#RRGGBB'.
+    - Accepte 'RRGGBB', '#RRGGBB', 'RGB' ; sinon fallback default.
+    """
+    if s is None or pd.isna(s):
+        return default
+    t = str(s).strip().lstrip("#")
+    if not t:
+        return default
+    if len(t) == 3 and all(c in "0123456789abcdefABCDEF" for c in t):
+        t = "".join(ch * 2 for ch in t)
+    t = t.upper()
+    if len(t) >= 6 and all(c in "0123456789ABCDEF" for c in t[:6]):
+        return "#" + t[:6]
+    return default
 
 # -----------------------------------------------------------------------------
 # Analyse
@@ -295,7 +296,7 @@ if run_button and tu_file is not None:
     trips_df = _ensure_min_schema(trips_df, {
         "trip_key": "string",
         "route_id": "string",
-        "trip_id":  "string",
+        "trip_id": "string",
         "start_date": "string",
         "start_time": "string",
         "trip_schedule_relationship": "Int64",
@@ -303,33 +304,30 @@ if run_button and tu_file is not None:
     stu_df = _ensure_min_schema(stu_df, {
         "trip_key": "string",
         "route_id": "string",
-        "trip_id":  "string",
-        "stop_id":  "string",
+        "trip_id": "string",
+        "stop_id": "string",
         "stop_sequence": "Int64",
         "stu_schedule_relationship": "Int64",
         "arrival_time": "float",
         "departure_time": "float",
     })
 
-    # ------------------------------ Filtres
+    # ----------------------------- Filtres
     st.sidebar.header("Filtres")
     route_opts = sorted([r for r in trips_df["route_id"].dropna().unique().tolist() if r != ""])
     route_sel = st.sidebar.multiselect("Filtrer par route_id", options=route_opts, default=[])
-
     map_trip = _sr_label_map_trip()
     trip_types = [(0, "SCHEDULED"), (1, "ADDED"), (2, "UNSCHEDULED"), (3, "CANCELED")]
     trip_sel_labels = st.sidebar.multiselect(
         "Types de voyages", options=[lbl for _, lbl in trip_types], default=[lbl for _, lbl in trip_types]
     )
     trip_sel_ids = {k for k, v in trip_types if v in set(trip_sel_labels)}
-
     map_stu = _sr_label_map_stu()
     stu_types = [(0, "SCHEDULED"), (1, "SKIPPED"), (2, "NO_DATA")]
     stu_sel_labels = st.sidebar.multiselect(
         "Types d'arrêts (STU)", options=[lbl for _, lbl in stu_types], default=[lbl for _, lbl in stu_types]
     )
     stu_sel_ids = {k for k, v in stu_types if v in set(stu_sel_labels)}
-
     trip_id_query = st.sidebar.text_input("Recherche trip_id (contient)", value="")
 
     trips_view = trips_df.copy()
@@ -346,7 +344,6 @@ if run_button and tu_file is not None:
         stu_view = stu_df.merge(trips_df[merge_cols], on="trip_key", how="left", suffixes=("", "_t"))
     else:
         stu_view = stu_df.copy()
-
     if route_sel:
         stu_view = stu_view[stu_view["route_id"].isin(route_sel)]
     if trip_id_query:
@@ -355,12 +352,12 @@ if run_button and tu_file is not None:
         if col_candidates:
             mask = False
             for c in col_candidates:
-                mask = mask | stu_view[c].fillna("").str.contains(trip_id_query, case=False)
+                mask = (mask | stu_view[c].fillna("").str.contains(trip_id_query, case=False))
             stu_view = stu_view[mask]
     if stu_sel_ids:
         stu_view = stu_view[stu_view["stu_schedule_relationship"].isin(stu_sel_ids)]
 
-    # ------------------------------ KPIs
+    # ----------------------------- KPIs
     st.subheader("Résumé")
     col1, col2, col3, col4, col5 = st.columns(5)
     total_trips = int(trips_view["trip_key"].nunique())
@@ -380,8 +377,8 @@ if run_button and tu_file is not None:
     col4.metric("Voyages non planifiés", f"{unscheduled_trips:,}".replace(",", " "))
     col5.metric("Voyages partiellement annulés", f"{partial_canceled_trips:,}".replace(",", " "))
 
-    # ------------------------------ Graphiques récapitulatifs
-    st.markdown("### Graphiques récapitulatifs")
+    # ----------------------------- Graphiques récapitulatifs
+    st.markdown("### ### Graphiques récapitulatifs")
     charts_col1, charts_col2 = st.columns(2)
     with charts_col1:
         summary_counts = pd.DataFrame([
@@ -393,15 +390,16 @@ if run_button and tu_file is not None:
         ])
         chart_summary = (
             alt.Chart(summary_counts)
-            .mark_bar()
-            .encode(
-                x=alt.X("type:N", sort="-y", title="Catégorie"),
-                y=alt.Y("val:Q", title="Nombre"),
-                tooltip=["type", "val"]
-            )
-            .properties(height=300)
+               .mark_bar()
+               .encode(
+                   x=alt.X("type:N", sort="-y", title="Catégorie"),
+                   y=alt.Y("val:Q", title="Nombre"),
+                   tooltip=["type", "val"]
+               )
+               .properties(height=300)
         )
         st.altair_chart(chart_summary, use_container_width=True)
+
     with charts_col2:
         if not stu_view.empty:
             dist = (
@@ -411,16 +409,143 @@ if run_button and tu_file is not None:
             )
             chart_dist = (
                 alt.Chart(dist)
-                .mark_arc(innerRadius=60)
-                .encode(theta="compte:Q", color="type:N", tooltip=["type", "compte"])
-                .properties(height=300)
+                   .mark_arc(innerRadius=60)
+                   .encode(theta="compte:Q", color="type:N", tooltip=["type", "compte"])
+                   .properties(height=300)
             )
             st.altair_chart(chart_dist, use_container_width=True)
         else:
             st.info("Aucun StopTimeUpdate après filtres.")
 
-    # ------------------------------ Courbe des passages (10 min)
-    st.markdown("### Courbe — Passages par tranches de 10 minutes (par type d'arrêt)")
+    # ----------------------------- Carte des trajets (Altair)
+    st.markdown("### 🗺️ Carte des trajets (Altair)")
+
+    stops_static = static_gtfs.get("stops", pd.DataFrame())
+    stop_times_static = static_gtfs.get("stop_times", pd.DataFrame())
+    trips_static = static_gtfs.get("trips", pd.DataFrame())
+    routes_static = static_gtfs.get("routes", pd.DataFrame())
+
+    missing_bits = []
+    if stops_static.empty or not {"stop_id", "stop_lat", "stop_lon"}.issubset(stops_static.columns):
+        missing_bits.append("`stops.txt` avec `stop_lat/stop_lon`")
+    if stop_times_static.empty or not {"trip_id", "stop_id", "stop_sequence"}.issubset(stop_times_static.columns):
+        missing_bits.append("`stop_times.txt` (trip_id, stop_id, stop_sequence)")
+    if trips_static.empty or "route_id" not in trips_static.columns:
+        missing_bits.append("`trips.txt` (trip_id, route_id)")
+    if routes_static.empty or "route_id" not in routes_static.columns:
+        missing_bits.append("`routes.txt`")
+
+    if missing_bits:
+        st.info("Carte indisponible : " + " ; ".join(missing_bits))
+    else:
+        trip_opts = sorted([t for t in trips_view["trip_id"].dropna().unique().tolist() if t != ""])
+        default_selection = trip_opts[:5]
+        trip_sel = st.multiselect(
+            "Trip_id à cartographier",
+            options=trip_opts,
+            default=default_selection,
+            help="Sélectionne un ou plusieurs voyages à tracer sur la carte."
+        )
+        max_trips = st.slider("Nombre maximal de trips représentés", 1, 50, max(1, len(trip_sel) or 5))
+        if trip_sel:
+            trip_sel = trip_sel[:max_trips]
+
+        if not trip_sel:
+            st.info("Sélectionne au moins un `trip_id` pour afficher la carte.")
+        else:
+            paths = (
+                stop_times_static[stop_times_static["trip_id"].isin(trip_sel)]
+                .merge(stops_static[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
+                .merge(trips_static[["trip_id", "route_id"]], on="trip_id", how="left")
+                .merge(routes_static[["route_id", "route_color"]], on="route_id", how="left")
+            )
+
+            paths = paths.dropna(subset=["stop_lat", "stop_lon"])
+            if "stop_sequence" in paths.columns:
+                # s'assure que l'ordre est numérique pour le tracé
+                paths["stop_sequence"] = pd.to_numeric(paths["stop_sequence"], errors="coerce")
+            paths["route_color"] = paths.get("route_color", pd.Series([], dtype="object")).apply(
+                lambda v: _normalize_hex_color(v, default="#4C78A8")
+            )
+
+            # Points annulés (SKIPPED) depuis le RT
+            sk_points = pd.DataFrame(columns=["trip_id", "stop_id", "stop_lat", "stop_lon", "stop_sequence"])
+            if not stu_view.empty and "stu_schedule_relationship" in stu_view.columns:
+                sk = stu_view[
+                    (stu_view["trip_id"].isin(trip_sel)) &
+                    (stu_view["stu_schedule_relationship"] == 1)  # 1 == SKIPPED
+                ].copy()
+                if not sk.empty:
+                    sk_points = sk.merge(stops_static[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
+                    if "stop_sequence" not in sk_points.columns or sk_points["stop_sequence"].isna().all():
+                        sk_points = sk_points.merge(
+                            stop_times_static[["trip_id", "stop_id", "stop_sequence"]],
+                            on=["trip_id", "stop_id"],
+                            how="left",
+                            suffixes=("", "_sched")
+                        )
+                    if "stop_sequence" in sk_points.columns:
+                        sk_points["stop_sequence"] = pd.to_numeric(sk_points["stop_sequence"], errors="coerce")
+
+            base = alt.Chart(paths).project("mercator").properties(height=520)
+
+            lines = (
+                base
+                .mark_line(strokeWidth=2, opacity=0.85)
+                .encode(
+                    longitude="stop_lon:Q",
+                    latitude="stop_lat:Q",
+                    detail="trip_id:N",
+                    order="stop_sequence:Q",
+                    color=alt.Color("route_color:N", scale=None, legend=None),
+                    tooltip=[
+                        alt.Tooltip("trip_id:N", title="Trip"),
+                        alt.Tooltip("route_id:N", title="Route"),
+                        alt.Tooltip("stop_id:N", title="Arrêt"),
+                        alt.Tooltip("stop_sequence:Q", title="Ordre")
+                    ]
+                )
+            )
+
+            points_all = (
+                base
+                .mark_point(filled=True, color="#999999", size=20, opacity=0.6)
+                .encode(
+                    longitude="stop_lon:Q",
+                    latitude="stop_lat:Q",
+                    tooltip=[
+                        alt.Tooltip("trip_id:N", title="Trip"),
+                        alt.Tooltip("stop_id:N", title="Arrêt"),
+                        alt.Tooltip("stop_sequence:Q", title="Ordre")
+                    ]
+                )
+            )
+
+            layer_sk = None
+            if not sk_points.empty:
+                layer_sk = (
+                    alt.Chart(sk_points)
+                    .project("mercator")
+                    .mark_point(filled=True, color="#E45756", size=90, opacity=0.95)
+                    .encode(
+                        longitude="stop_lon:Q",
+                        latitude="stop_lat:Q",
+                        tooltip=[
+                            alt.Tooltip("trip_id:N", title="Trip"),
+                            alt.Tooltip("stop_id:N", title="Arrêt (SKIPPED)"),
+                            alt.Tooltip("stop_sequence:Q", title="Ordre")
+                        ]
+                    )
+                )
+
+            chart_map = lines + points_all
+            if layer_sk is not None:
+                chart_map = chart_map + layer_sk
+
+            st.altair_chart(chart_map.interactive(), use_container_width=True)
+
+    # ----------------------------- Courbe des passages (10 min)
+    st.markdown("### ### Courbe — Passages par tranches de 10 minutes (par type d'arrêt)")
     if not stu_view.empty:
         try:
             stu_10 = _add_local_bin10(stu_view, tz_input)
@@ -438,17 +563,17 @@ if run_button and tu_file is not None:
         if not series_passages.empty:
             line_passages = (
                 alt.Chart(series_passages)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X(
-                        "bin10_label:N",
-                        sort=alt.SortField(field="bin10_minute", order="ascending"),
-                        title="Heure locale (10 min)"),
-                    y=alt.Y("compte:Q", title="Nombre"),
-                    color=alt.Color("type:N", title="Type d'arrêt"),
-                    tooltip=["bin10_label", "type", "compte"]
-                )
-                .properties(height=320)
+                   .mark_line(point=True)
+                   .encode(
+                       x=alt.X(
+                           "bin10_label:N",
+                           sort=alt.SortField(field="bin10_minute", order="ascending"),
+                           title="Heure locale (10 min)"),
+                       y=alt.Y("compte:Q", title="Nombre"),
+                       color=alt.Color("type:N", title="Type d'arrêt"),
+                       tooltip=["bin10_label", "type", "compte"]
+                   )
+                   .properties(height=320)
             )
             st.altair_chart(line_passages, use_container_width=True)
         else:
@@ -456,30 +581,30 @@ if run_button and tu_file is not None:
     else:
         st.info("Aucun STU à représenter pour la courbe des passages.")
 
-    # ------------------------------ Courbes des annulations de voyages (10 min)
-    st.markdown("### Courbes — Annulations de voyages (complètes vs partielles, 10 min)")
+    # ----------------------------- Courbes des annulations de voyages (10 min)
+    st.markdown("### ### Courbes — Annulations de voyages (complètes vs partielles, 10 min)")
     series_cancel = _trips_binning_for_cancellations(trips_view, stu_view, tz_input)
     if not series_cancel.empty:
         line_cancel = (
             alt.Chart(series_cancel)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X(
-                    "bin10_label:N",
-                    sort=alt.SortField(field="bin10_minute", order="ascending"),
-                    title="Heure locale (10 min)"),
-                y=alt.Y("compte:Q", title="Nombre de voyages"),
-                color=alt.Color("kind:N", title="Type d'annulation"),
-                tooltip=["bin10_label", "kind", "compte"]
-            )
-            .properties(height=320)
+               .mark_line(point=True)
+               .encode(
+                   x=alt.X(
+                       "bin10_label:N",
+                       sort=alt.SortField(field="bin10_minute", order="ascending"),
+                       title="Heure locale (10 min)"),
+                   y=alt.Y("compte:Q", title="Nombre de voyages"),
+                   color=alt.Color("kind:N", title="Type d'annulation"),
+                   tooltip=["bin10_label", "kind", "compte"]
+               )
+               .properties(height=320)
         )
         st.altair_chart(line_cancel, use_container_width=True)
     else:
         st.info("Pas de voyages annulés (complets ou partiels) dans la sélection.")
 
-    # ------------------------------ Top 20 arrêts annulés
-    st.markdown("### Top 20 des arrêts annulés (SKIPPED)")
+    # ----------------------------- Top 20 arrêts annulés
+    st.markdown("### ### Top 20 des arrêts annulés (SKIPPED)")
     sk_only = stu_view[stu_view["stu_schedule_relationship"] == 1]
     if not sk_only.empty:
         top_sk = (
@@ -492,160 +617,24 @@ if run_button and tu_file is not None:
             top_sk = top_sk.merge(stops_static[["stop_id", "stop_name"]], on="stop_id", how="left")
         chart_top = (
             alt.Chart(top_sk)
-            .mark_bar()
-            .encode(
-                x=alt.X("compte:Q", title="Nombre de SKIPPED"),
-                y=(
-                    alt.Y("stop_name:N", sort="-x", title="Arrêt").axis(labelLimit=250)
-                    if "stop_name" in top_sk.columns else
-                    alt.Y("stop_id:N", sort="-x", title="stop_id")
-                ),
-                tooltip=top_sk.columns.tolist()
-            )
-            .properties(height=400)
+               .mark_bar()
+               .encode(
+                   x=alt.X("compte:Q", title="Nombre de SKIPPED"),
+                   y=(
+                       alt.Y("stop_name:N", sort="-x", title="Arrêt").axis(labelLimit=250)
+                       if "stop_name" in top_sk.columns else
+                       alt.Y("stop_id:N", sort="-x", title="stop_id")
+                   ),
+                   tooltip=top_sk.columns.tolist()
+               )
+               .properties(height=400)
         )
         st.altair_chart(chart_top, use_container_width=True)
     else:
         st.info("Aucun arrêt annulé dans la sélection.")
-    # -----------------------------------------------------------------------------
-# Carte des trajets (Altair)
-# -----------------------------------------------------------------------------
-st.markdown("### 🗺️ Carte des trajets (Altair)")
 
-stops_static = static_gtfs.get("stops", pd.DataFrame())
-stop_times_static = static_gtfs.get("stop_times", pd.DataFrame())
-trips_static = static_gtfs.get("trips", pd.DataFrame())
-routes_static = static_gtfs.get("routes", pd.DataFrame())
-
-# Vérifications minimales
-missing_bits = []
-if stops_static.empty or not {"stop_id", "stop_lat", "stop_lon"}.issubset(stops_static.columns):
-    missing_bits.append("`stops.txt` avec `stop_lat/stop_lon`")
-if stop_times_static.empty or not {"trip_id", "stop_id", "stop_sequence"}.issubset(stop_times_static.columns):
-    missing_bits.append("`stop_times.txt` (trip_id, stop_id, stop_sequence)")
-if trips_static.empty or "route_id" not in trips_static.columns:
-    missing_bits.append("`trips.txt` (trip_id, route_id)")
-if routes_static.empty or "route_id" not in routes_static.columns:
-    missing_bits.append("`routes.txt`")
-if missing_bits:
-    st.info("Carte indisponible : " + " ; ".join(missing_bits))
-else:
-    # Options UI
-    # On propose les trip_id disponibles après filtres
-    trip_opts = sorted([t for t in trips_view["trip_id"].dropna().unique().tolist() if t != ""])
-    default_selection = trip_opts[:5]  # limite par défaut pour éviter les gros rendus
-    trip_sel = st.multiselect(
-        "Trip_id à cartographier",
-        options=trip_opts,
-        default=default_selection,
-        help="Sélectionne un ou plusieurs voyages à tracer sur la carte."
-    )
-    max_trips = st.slider("Nombre maximal de trips représentés", 1, 50, max(1, len(trip_sel) or 5))
-    if trip_sel:
-        trip_sel = trip_sel[:max_trips]
-
-    if not trip_sel:
-        st.info("Sélectionne au moins un `trip_id` pour afficher la carte.")
-    else:
-        # Prépare les chemins: stop_times -> stops (coords) -> trips (route) -> route_color
-        paths = (
-            stop_times_static[stop_times_static["trip_id"].isin(trip_sel)]
-            .merge(stops_static[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
-            .merge(trips_static[["trip_id", "route_id"]], on="trip_id", how="left")
-            .merge(routes_static[["route_id", "route_color"]], on="route_id", how="left")
-        )
-
-        # Nettoyage / types
-        # ordre des points, coords valides
-        paths = paths.dropna(subset=["stop_lat", "stop_lon"])
-        # normalise couleurs
-        paths["route_color"] = paths.get("route_color", pd.Series([], dtype="object")).apply(
-            lambda v: _normalize_hex_color(v, default="#4C78A8")  # bleu clair par défaut
-        )
-
-        # Points annulés (SKIPPED) depuis le RT pour les trips sélectionnés
-        sk_points = pd.DataFrame(columns=["trip_id", "stop_id", "stop_lat", "stop_lon", "stop_sequence"])
-        if not stu_view.empty and "stu_schedule_relationship" in stu_view.columns:
-            sk = stu_view[
-                (stu_view["trip_id"].isin(trip_sel)) &
-                (stu_view["stu_schedule_relationship"] == 1)  # 1 == SKIPPED
-            ].copy()
-            if not sk.empty:
-                # Pour placer le point, on merge sur stops pour récupérer lat/lon
-                sk_points = sk.merge(stops_static[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
-                # On tente d'ajouter stop_sequence (si absent côté STU)
-                if "stop_sequence" not in sk_points.columns or sk_points["stop_sequence"].isna().all():
-                    sk_points = sk_points.merge(
-                        stop_times_static[["trip_id", "stop_id", "stop_sequence"]],
-                        on=["trip_id", "stop_id"],
-                        how="left",
-                        suffixes=("", "_sched")
-                    )
-
-        # Construit les couches Altair
-        base = alt.Chart(paths).project("mercator").properties(height=520)
-
-        # Lignes de parcours, colorées par route_color (couleur directe, pas d'échelle)
-        lines = (
-            base
-            .mark_line(strokeWidth=2, opacity=0.85)
-            .encode(
-                longitude="stop_lon:Q",
-                latitude="stop_lat:Q",
-                detail="trip_id:N",
-                order="stop_sequence:Q",
-                color=alt.Color("route_color:N", scale=None, legend=None),
-                tooltip=[
-                    alt.Tooltip("trip_id:N", title="Trip"),
-                    alt.Tooltip("route_id:N", title="Route"),
-                    alt.Tooltip("stop_id:N", title="Arrêt"),
-                    alt.Tooltip("stop_sequence:Q", title="Ordre")
-                ]
-            )
-        )
-
-        # (Optionnel) petits points gris pour tous les arrêts tracés (contexte)
-        points_all = (
-            base
-            .mark_point(filled=True, color="#999999", size=20, opacity=0.6)
-            .encode(
-                longitude="stop_lon:Q",
-                latitude="stop_lat:Q",
-                tooltip=[
-                    alt.Tooltip("trip_id:N", title="Trip"),
-                    alt.Tooltip("stop_id:N", title="Arrêt"),
-                    alt.Tooltip("stop_sequence:Q", title="Ordre")
-                ]
-            )
-        )
-
-        # Points rouges pour SKIPPED
-        layer_sk = None
-        if not sk_points.empty:
-            layer_sk = (
-                alt.Chart(sk_points)
-                .project("mercator")
-                .mark_point(filled=True, color="#E45756", size=90, opacity=0.95)
-                .encode(
-                    longitude="stop_lon:Q",
-                    latitude="stop_lat:Q",
-                    tooltip=[
-                        alt.Tooltip("trip_id:N", title="Trip"),
-                        alt.Tooltip("stop_id:N", title="Arrêt (SKIPPED)"),
-                        alt.Tooltip("stop_sequence:Q", title="Ordre")
-                    ]
-                )
-            )
-
-        # Assemble la carte
-        chart_map = lines + points_all
-        if layer_sk is not None:
-            chart_map = chart_map + layer_sk
-
-        st.altair_chart(chart_map.interactive(), use_container_width=True)
-
-    # ------------------------------ Comparaison au planifié (si GTFS fourni)
-    st.markdown("### Écart vs horaire planifié (si GTFS fourni)")
+    # ----------------------------- Comparaison au planifié (si GTFS fourni)
+    st.markdown("### ### Écart vs horaire planifié (si GTFS fourni)")
     if not sched_df.empty and schedule_stats:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Lignes comparées", f"{schedule_stats.get('rows_compared', 0):,}".replace(",", " "))
@@ -668,12 +657,12 @@ else:
                 if not df_arr_hist.empty:
                     chart_arr = (
                         alt.Chart(df_arr_hist)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("bin_center:Q", title="Écart (minutes, +retard / -avance)"),
-                            y=alt.Y("count:Q", title="Nombre")
-                        )
-                        .properties(height=300)
+                           .mark_bar()
+                           .encode(
+                               x=alt.X("bin_center:Q", title="Écart (minutes, +retard / -avance)"),
+                               y=alt.Y("count:Q", title="Nombre")
+                           )
+                           .properties(height=300)
                     )
                     st.altair_chart(chart_arr, use_container_width=True)
                 else:
@@ -687,12 +676,12 @@ else:
                 if not df_dep_hist.empty:
                     chart_dep = (
                         alt.Chart(df_dep_hist)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("bin_center:Q", title="Écart (minutes)"),
-                            y=alt.Y("count:Q", title="Nombre")
-                        )
-                        .properties(height=300)
+                           .mark_bar()
+                           .encode(
+                               x=alt.X("bin_center:Q", title="Écart (minutes)"),
+                               y=alt.Y("count:Q", title="Nombre")
+                           )
+                           .properties(height=300)
                     )
                     st.altair_chart(chart_dep, use_container_width=True)
                 else:
@@ -704,8 +693,8 @@ else:
 
     st.divider()
 
-    # ------------------------------ Validation CSV d’annulations (fenêtre 2 h)
-    st.markdown("### Valider un fichier d’annulations (fenêtre 2 h)")
+    # ----------------------------- Validation CSV d’annulations (fenêtre 2 h)
+    st.markdown("### ### Valider un fichier d’annulations (fenêtre 2 h)")
     with st.expander("Ajouter un CSV d’annulations et valider sur une fenêtre temporelle"):
         canc_file = st.file_uploader(
             "Fichier d’annulations (CSV) — colonnes: Trip_id,Start_date,Route_id,Stop_id,Stop_seq",
@@ -721,7 +710,6 @@ else:
                    if static_gtfs.get("agency", pd.DataFrame()).shape[0] else tz_input)
         )
         run_val = st.button("Valider les annulations", type="primary")
-
         if run_val and canc_file is not None:
             try:
                 canc_df = pd.read_csv(canc_file, dtype={"Trip_id": str, "Route_id": str, "Stop_id": str})
@@ -768,8 +756,8 @@ else:
 
     st.divider()
 
-    # ------------------------------ Détails JSON
-    st.markdown("### Détails (JSON)")
+    # ----------------------------- Détails JSON
+    st.markdown("### ### Détails (JSON)")
     st.json({
         "meta": analysis["meta"],
         "summary": analysis["summary"],
@@ -782,8 +770,8 @@ else:
         }
     })
 
-    # ------------------------------ Téléchargements
-    st.markdown("### Téléchargements")
+    # ----------------------------- Téléchargements
+    st.markdown("### ### Téléchargements")
     cdl1, cdl2, cdl3, cdl4 = st.columns(4)
     with cdl1:
         st.download_button("⬇️ trips.csv", _to_csv_bytes(trips_df), "trips.csv", mime="text/csv")
@@ -811,8 +799,8 @@ else:
             mime="application/json"
         )
 
-    # ------------------------------ Tables
-    st.markdown("### Tables")
+    # ----------------------------- Tables
+    st.markdown("### ### Tables")
     show_trips, show_stu, show_anom = st.columns(3)
     with show_trips:
         show_trips_flag = st.checkbox("Afficher trips.csv", value=True)
@@ -846,4 +834,4 @@ else:
 
 else:
     st.info("Charge au moins un fichier **TripUpdates (Protocol Buffer)** puis clique **Analyser** dans la barre latérale.")
-
+``
