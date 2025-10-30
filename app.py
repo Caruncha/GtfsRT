@@ -407,36 +407,56 @@ def attach_schedule_based_delay(
     Calcule 'delay_from_sched' par arrêt en comparant:
       RT (arrival/departure epoch)  VS  start_date (local tz) + HH:MM:SS planifié (stop_times)
     -> Résultat en secondes (Int64). Ne modifie pas l'entrée; retourne une copie enrichie.
+    Gère les colonnes suffixées par la jointure (arrival_time_rt / departure_time_rt).
     """
     if sched_vs_rt.empty:
         return sched_vs_rt
 
     df = sched_vs_rt.copy()
 
-    # Ajoute start_date (YYYYMMDD)
-    start_dates = rt_trips[["trip_id", "start_date"]].drop_duplicates() if not rt_trips.empty else pd.DataFrame(columns=["trip_id","start_date"])
-    df = pd.merge(df, start_dates, on="trip_id", how="left")
+    # 1) Ajout de start_date (YYYYMMDD) par trip
+    if not rt_trips.empty and "trip_id" in df.columns and "trip_id" in rt_trips.columns:
+        start_dates = rt_trips[["trip_id", "start_date"]].drop_duplicates()
+        df = pd.merge(df, start_dates, on="trip_id", how="left")
+    else:
+        df["start_date"] = pd.NA
 
-    # Seconds planifiées (arrival_time_sec prioritaire, sinon departure_time_sec)
-    sched_sec = df[["arrival_time_sec", "departure_time_sec"]].bfill(axis=1).iloc[:, 0]
-    df["sched_sec"] = pd.to_numeric(sched_sec, errors="coerce")
+    # 2) Seconds planifiées (arrival_time_sec prioritaire, sinon departure_time_sec)
+    #    -> ces colonnes proviennent de stop_times.txt (côté _sched)
+    sched_cols = [c for c in ["arrival_time_sec", "departure_time_sec"] if c in df.columns]
+    if sched_cols:
+        df["sched_sec"] = pd.to_numeric(df[sched_cols].bfill(axis=1).iloc[:, 0], errors="coerce")
+    else:
+        df["sched_sec"] = pd.NA
 
-    # Datetime planifié local -> UTC
+    # 3) Datetime planifié local -> UTC
     start_local = pd.to_datetime(df["start_date"], format="%Y%m%d", errors="coerce")
     try:
+        # pandas >= 2.0 : gestion DST précise
         start_local = start_local.dt.tz_localize(timezone, nonexistent="shift_forward", ambiguous="NaT")
     except Exception:
-        # Fallback si le tzlocalize avec flags n'est pas disponible
+        # fallback générique
         start_local = start_local.dt.tz_localize(timezone, errors="coerce")
 
     sched_dt_local = start_local + pd.to_timedelta(df["sched_sec"], unit="s")
-    sched_dt_utc = sched_dt_local.dt.tz_convert("UTC")
+    try:
+        sched_dt_utc = sched_dt_local.dt.tz_convert("UTC")
+    except Exception:
+        # Si tz est déjà UTC ou NaT
+        sched_dt_utc = sched_dt_local
 
-    # Datetime RT (epoch seconds -> UTC)
-    rt_epoch = df[["arrival_time", "departure_time"]].bfill(axis=1).iloc[:, 0]
-    df["rt_dt"] = pd.to_datetime(pd.to_numeric(rt_epoch, errors="coerce"), unit="s", utc=True, errors="coerce")
+    # 4) Datetime RT (epoch seconds -> UTC)
+    #    -> préfère arrival_time_rt puis arrival_time, puis departure_time_rt, puis departure_time
+    rt_time_candidates = [c for c in ["arrival_time_rt", "arrival_time", "departure_time_rt", "departure_time"] if c in df.columns]
+    if rt_time_candidates:
+        rt_epoch = pd.to_numeric(df[rt_time_candidates].bfill(axis=1).iloc[:, 0], errors="coerce")
+        df["rt_dt"] = pd.to_datetime(rt_epoch, unit="s", utc=True, errors="coerce")
+    else:
+        # aucune colonne RT exploitable
+        df["rt_dt"] = pd.NaT
 
-    # Différence (RT - Scheduled) en secondes
+    # 5) Différence (RT - Scheduled) en secondes
+    #    -> handle NaT proprement (résultat NaN -> Int64 NA)
     delta = (df["rt_dt"] - sched_dt_utc).dt.total_seconds()
     df["delay_from_sched"] = pd.to_numeric(delta, errors="coerce").round().astype("Int64")
 
@@ -893,3 +913,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
