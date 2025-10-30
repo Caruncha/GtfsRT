@@ -4,15 +4,16 @@
 # Version simplifiée + visualisations demandées :
 #   - Synthèse (voyages annulés & partiellement annulés)
 #   - Résumé par voyage
-#   - Anomalies (table) + GRAPHIQUES :
+#   - Anomalies (table)
+#   - GRAPHIQUES :
 #       * Anomalies (sans doublons)
-#       * Répartition des statuts d'arrêts
-#       * Retards moyens (par route si dispo, sinon global)
-# Retiré précédemment : téléchargements, détails par arrêt, autres graphiques.
+#       * Répartition des statuts des arrêts
+#       * Retards moyens (calculés vs schedule, sur l'ensemble des arrêts)
+# Retiré : téléchargements, détails par arrêt, autres graphiques.
 # Optimisé gros GTFS (filtrage par trips RT, lecture par chunks, dtypes compacts).
 # ---------------------------------------------------------
 # Dépendances :
-#   pip install streamlit pandas altair gtfs-realtime-bindings protobuf
+#   pip install streamlit pandas altair gtfs-realtime-bindings protobuf pytz
 # ---------------------------------------------------------
 
 from __future__ import annotations
@@ -55,6 +56,9 @@ st.set_page_config(
 # ---------------------------------------------
 TRIP_SCHED_REL = {0: "SCHEDULED", 1: "ADDED", 2: "UNSCHEDULED", 3: "CANCELED"}
 STOP_SCHED_REL = {0: "SCHEDULED", 1: "SKIPPED", 2: "NO_DATA"}
+
+# Timezone locale du réseau (Montréal) utilisée pour convertir start_date + HH:MM:SS
+TIMEZONE = "America/Toronto"  # couvre le Québec (Montréal) avec DST
 
 
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -388,11 +392,55 @@ def compute_schedule_vs_rt(
         if c in merged.columns:
             merged[c] = merged[c].astype("Int64")
 
+    # Délai "best" natif RT (utile pour anomalies, mais PAS pour le graphe demandé)
     if "arrival_delay" in merged.columns and "departure_delay" in merged.columns:
         merged["delay_best"] = merged[["arrival_delay", "departure_delay"]].bfill(axis=1).iloc[:, 0]
         merged["delay_best"] = pd.to_numeric(merged["delay_best"], errors="coerce").astype("Int64")
 
     return merged
+
+
+def attach_schedule_based_delay(
+    sched_vs_rt: pd.DataFrame, rt_trips: pd.DataFrame, timezone: str = TIMEZONE
+) -> pd.DataFrame:
+    """
+    Calcule 'delay_from_sched' par arrêt en comparant:
+      RT (arrival/departure epoch)  VS  start_date (local tz) + HH:MM:SS planifié (stop_times)
+    -> Résultat en secondes (Int64). Ne modifie pas l'entrée; retourne une copie enrichie.
+    """
+    if sched_vs_rt.empty:
+        return sched_vs_rt
+
+    df = sched_vs_rt.copy()
+
+    # Ajoute start_date (YYYYMMDD)
+    start_dates = rt_trips[["trip_id", "start_date"]].drop_duplicates() if not rt_trips.empty else pd.DataFrame(columns=["trip_id","start_date"])
+    df = pd.merge(df, start_dates, on="trip_id", how="left")
+
+    # Seconds planifiées (arrival_time_sec prioritaire, sinon departure_time_sec)
+    sched_sec = df[["arrival_time_sec", "departure_time_sec"]].bfill(axis=1).iloc[:, 0]
+    df["sched_sec"] = pd.to_numeric(sched_sec, errors="coerce")
+
+    # Datetime planifié local -> UTC
+    start_local = pd.to_datetime(df["start_date"], format="%Y%m%d", errors="coerce")
+    try:
+        start_local = start_local.dt.tz_localize(timezone, nonexistent="shift_forward", ambiguous="NaT")
+    except Exception:
+        # Fallback si le tzlocalize avec flags n'est pas disponible
+        start_local = start_local.dt.tz_localize(timezone, errors="coerce")
+
+    sched_dt_local = start_local + pd.to_timedelta(df["sched_sec"], unit="s")
+    sched_dt_utc = sched_dt_local.dt.tz_convert("UTC")
+
+    # Datetime RT (epoch seconds -> UTC)
+    rt_epoch = df[["arrival_time", "departure_time"]].bfill(axis=1).iloc[:, 0]
+    df["rt_dt"] = pd.to_datetime(pd.to_numeric(rt_epoch, errors="coerce"), unit="s", utc=True, errors="coerce")
+
+    # Différence (RT - Scheduled) en secondes
+    delta = (df["rt_dt"] - sched_dt_utc).dt.total_seconds()
+    df["delay_from_sched"] = pd.to_numeric(delta, errors="coerce").round().astype("Int64")
+
+    return df
 
 
 def summarize_trips(
@@ -401,7 +449,7 @@ def summarize_trips(
     trips_df: pd.DataFrame,
     routes_df: pd.DataFrame
 ) -> pd.DataFrame:
-    """Résumé par trip: statut, nb updates, nb SKIPPED / NO_DATA, stats de délai."""
+    """Résumé par trip: statut, nb updates, nb SKIPPED / NO_DATA, stats de délai (RT natif)."""
     if rt_trips.empty:
         return pd.DataFrame()
 
@@ -548,7 +596,7 @@ def detect_anomalies(
                 "details": "stop_sequence manquant pour un arrêt SCHEDULED"
             })
 
-    # retards extrêmes
+    # retards extrêmes (basés sur delay_best RT natif)
     if sched_vs_rt is not None and not sched_vs_rt.empty and "delay_best" in sched_vs_rt.columns:
         extreme = sched_vs_rt[sched_vs_rt["delay_best"].abs() > extreme_delay_threshold]
         for _, r in extreme.iterrows():
@@ -587,7 +635,6 @@ def chart_anomalies_dedup(anomalies_df: pd.DataFrame):
     """Bar chart du nombre d'anomalies par type, après dé-duplication logique."""
     if not _HAS_ALTAIR or anomalies_df.empty:
         return None
-    # Dé-dup: on considère (anomaly_type, trip_id, stop_id, stop_sequence) comme clé unique
     dedup = anomalies_df.drop_duplicates(subset=["anomaly_type","trip_id","stop_id","stop_sequence"])
     agg = dedup.groupby("anomaly_type", as_index=False).size().rename(columns={"size":"count"})
     chart = alt.Chart(agg).mark_bar().encode(
@@ -615,18 +662,28 @@ def chart_stop_status_distribution(rt_su: pd.DataFrame):
     return chart.interactive()
 
 
-def chart_mean_delays(rt_su: pd.DataFrame, trips_df: pd.DataFrame, routes_df: pd.DataFrame):
-    """Bar chart des retards moyens : par route si dispo, sinon global."""
-    if not _HAS_ALTAIR or rt_su.empty:
+def chart_mean_delays_vs_schedule(
+    sched_vs_rt_with_delay: pd.DataFrame,
+    trips_df: pd.DataFrame,
+    routes_df: pd.DataFrame
+):
+    """
+    Bar chart des retards moyens (vs schedule) :
+      - calculés sur l'ensemble des arrêts (delay_from_sched)
+      - agrégés par route si disponible, sinon global.
+    """
+    if not _HAS_ALTAIR or sched_vs_rt_with_delay.empty:
         return None
-    df = rt_su.copy()
-    # delay_best
-    df["delay_best"] = df[["arrival_delay","departure_delay"]].bfill(axis=1).iloc[:,0]
-    df = df[pd.notna(df["delay_best"])]
+
+    df = sched_vs_rt_with_delay.copy()
+    if "delay_from_sched" not in df.columns:
+        return None
+
+    df = df[pd.notna(df["delay_from_sched"])]
     if df.empty:
         return None
 
-    # Si route connue : moyenne par route_label
+    # Joindre la route si disponible
     has_routes = (not trips_df.empty) and ("route_id" in trips_df.columns)
     if has_routes:
         df = df.merge(trips_df[["trip_id","route_id"]], on="trip_id", how="left")
@@ -634,32 +691,30 @@ def chart_mean_delays(rt_su: pd.DataFrame, trips_df: pd.DataFrame, routes_df: pd
             df = df.merge(routes_df, on="route_id", how="left")
         df["route_label"] = _route_label(df)
         df = df[pd.notna(df["route_label"])]
-        if df.empty:
-            has_routes = False
 
-    if has_routes:
-        agg = df.groupby("route_label", as_index=False)["delay_best"].mean()
-        agg = agg.sort_values("delay_best", ascending=False)
+    if has_routes and not df.empty:
+        agg = df.groupby("route_label", as_index=False)["delay_from_sched"].mean()
+        agg = agg.sort_values("delay_from_sched", ascending=False)
         chart = alt.Chart(agg).mark_bar().encode(
             x=alt.X("route_label:N", title="Route", sort="-y"),
-            y=alt.Y("delay_best:Q", title="Retard moyen (s)"),
-            color=alt.Color("delay_best:Q", scale=alt.Scale(scheme="redyellowgreen", reverse=True), legend=None),
+            y=alt.Y("delay_from_sched:Q", title="Retard moyen vs schedule (s)"),
+            color=alt.Color("delay_from_sched:Q", scale=alt.Scale(scheme="redyellowgreen", reverse=True), legend=None),
             tooltip=[alt.Tooltip("route_label:N", title="Route"),
-                     alt.Tooltip("delay_best:Q", title="Retard moyen (s)", format=".1f")]
-        ).properties(title="Retards moyens par route")
+                     alt.Tooltip("delay_from_sched:Q", title="Retard moyen (s)", format=".1f")]
+        ).properties(title="Retards moyens par route (vs schedule)")
         return chart.interactive()
     else:
-        # Global unique barre
+        # Global
         agg = pd.DataFrame({
             "label": ["Global"],
-            "delay_best": [float(df["delay_best"].mean())]
+            "delay_from_sched": [float(df["delay_from_sched"].mean())]
         })
         chart = alt.Chart(agg).mark_bar().encode(
             x=alt.X("label:N", title=""),
-            y=alt.Y("delay_best:Q", title="Retard moyen (s)"),
-            color=alt.Color("delay_best:Q", scale=alt.Scale(scheme="redyellowgreen", reverse=True), legend=None),
-            tooltip=[alt.Tooltip("delay_best:Q", title="Retard moyen (s)", format=".1f")]
-        ).properties(title="Retard moyen (global)")
+            y=alt.Y("delay_from_sched:Q", title="Retard moyen vs schedule (s)"),
+            color=alt.Color("delay_from_sched:Q", scale=alt.Scale(scheme="redyellowgreen", reverse=True), legend=None),
+            tooltip=[alt.Tooltip("delay_from_sched:Q", title="Retard moyen (s)", format=".1f")]
+        ).properties(title="Retard moyen (global) vs schedule")
         return chart.interactive()
 
 
@@ -668,7 +723,7 @@ def chart_mean_delays(rt_su: pd.DataFrame, trips_df: pd.DataFrame, routes_df: pd
 # ---------------------------------------------
 def main():
     st.title("🚌 Analyse GTFS-RT TripUpdates vs GTFS (simplifiée + graphiques)")
-    st.caption("Synthèse, résumé, anomalies & 3 graphiques (anomalies, statuts d'arrêts, retards moyens). Optimisée pour gros GTFS.")
+    st.caption("Synthèse, résumé, anomalies & graphiques (anomalies, statuts d'arrêts, retards moyens vs schedule). Optimisée pour gros GTFS.")
 
     with st.sidebar:
         st.header("Fichiers d'entrée")
@@ -687,9 +742,11 @@ def main():
     if not run_btn:
         st.info("💡 Charge les fichiers puis clique sur **Lancer l'analyse**.")
         return
+
     if not gtfs_zip or not rt_file:
         st.error("Merci de fournir le **GTFS statique (.zip)** et le **TripUpdate (.pb/.bin/.json)**.")
         return
+
     # Lecture bytes
     gtfs_bytes = gtfs_zip.getvalue() if hasattr(gtfs_zip, "getvalue") else gtfs_zip.read()
     rt_bytes = rt_file.getvalue() if hasattr(rt_file, "getvalue") else rt_file.read()
@@ -730,6 +787,8 @@ def main():
 
     progress.progress(94, text="Jointure Schedule vs RT...")
     sched_vs_rt = compute_schedule_vs_rt(rt_su, stop_times_df, stops_df)
+    # Calcul du retard vs schedule (par arrêt)
+    sched_vs_rt = attach_schedule_based_delay(sched_vs_rt, rt_trips, timezone=TIMEZONE)
 
     progress.progress(100, text="Synthèse...")
     summary_df = summarize_trips(rt_trips, rt_su, trips_df, routes_df)
@@ -807,13 +866,14 @@ def main():
             else:
                 st.info("Aucun statut d'arrêt exploitable.")
 
-        ch3 = chart_mean_delays(rt_su, trips_df, routes_df)
+        ch3 = chart_mean_delays_vs_schedule(sched_vs_rt, trips_df, routes_df)
         if ch3 is not None:
             st.altair_chart(ch3, use_container_width=True)
         else:
-            st.info("Impossible de calculer un retard moyen (données de delay manquantes).")
+            st.info("Impossible de calculer les retards moyens vs schedule (données manquantes).")
 
     # Debug
+    show_raw_tables = st.sidebar.checkbox("Afficher tables brutes (debug)", value=False)
     if show_raw_tables:
         st.divider()
         st.subheader("Debug: tables brutes")
@@ -821,14 +881,10 @@ def main():
             st.dataframe(rt_trips, use_container_width=True, height=220)
         with st.expander("RT: Stop Updates"):
             st.dataframe(rt_su, use_container_width=True, height=220)
-        with st.expander("GTFS: trips (filtré)"):
-            st.dataframe(trips_df, use_container_width=True, height=220)
         with st.expander("GTFS: stop_times (filtré)"):
             st.dataframe(stop_times_df.head(1000), use_container_width=True, height=220)
-        with st.expander("GTFS: stops (filtré)"):
-            st.dataframe(stops_df, use_container_width=True, height=220)
-        with st.expander("GTFS: routes (filtré)"):
-            st.dataframe(routes_df, use_container_width=True, height=220)
+        with st.expander("Join: sched_vs_rt (+ delay_from_sched)"):
+            st.dataframe(sched_vs_rt.head(1000), use_container_width=True, height=220)
 
     # Mémoire
     del gtfs_bytes, rt_bytes
