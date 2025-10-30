@@ -669,9 +669,9 @@ def chart_stop_status_distribution(rt_su: pd.DataFrame):
 def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
     """
     Histogramme (pas 1 minute) de la répartition avance/retard vs schedule
-    sur l'ensemble des arrêts. delay_min = round(delay_from_sched / 60).
-    L'axe X est recentré/contraint entre l'avance max (min) et le retard max (max)
-    trouvés dans le feed, au pas de la minute.
+    sur l'ensemble des arrêts, limité à [-30, +30] minutes.
+    - Les données en dehors de cette plage sont EXCLUES du calcul (non considérées).
+    - delay_min = round(delay_from_sched / 60).
     """
     if not _HAS_ALTAIR or sched_vs_rt_with_delay.empty:
         return None
@@ -680,28 +680,29 @@ def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
     if "delay_from_sched" not in df.columns:
         return None
 
+    # 1) Filtrer STRICTEMENT les arrêts dans [-30, +30] minutes sur la base des secondes,
+    #    pour éviter d'inclure par arrondi des valeurs comme 30.4 min.
     df = df[pd.notna(df["delay_from_sched"])]
     if df.empty:
         return None
 
-    # -- Bornes exactes en minutes :
-    #    * avance max = min_sec -> floor(min_sec/60)
-    #    * retard max = max_sec -> ceil(max_sec/60)
-    min_sec = float(df["delay_from_sched"].min())
-    max_sec = float(df["delay_from_sched"].max())
-    min_min = math.floor(min_sec / 60.0)
-    max_min = math.ceil(max_sec / 60.0)
+    min_sec, max_sec = -30 * 60, 30 * 60
+    df = df[(df["delay_from_sched"] >= min_sec) & (df["delay_from_sched"] <= max_sec)]
+    if df.empty:
+        return None
 
-    # Binning à la minute (discrétisation) pour l'histogramme
+    # 2) Discrétisation à la minute (arrondi à la minute la plus proche)
     df["delay_min"] = (df["delay_from_sched"].astype("float") / 60.0).round().astype("Int64")
+
+    # 3) Agrégation
     agg = df.groupby("delay_min", as_index=False).size().rename(columns={"size": "count"})
 
-    # Histogramme limité exactement aux extrêmes observés
+    # 4) Graphique : histogramme + règle verticale à 0, axe X figé sur [-30, +30]
     bars = alt.Chart(agg).mark_bar().encode(
         x=alt.X(
             "delay_min:Q",
             title="Délai vs schedule (minutes) — avance < 0 | retard > 0",
-            scale=alt.Scale(domain=[min_min, max_min], nice=False, zero=False),
+            scale=alt.Scale(domain=[-30, 30], nice=False, zero=False),
         ),
         y=alt.Y("count:Q", title="Nombre d'arrêts"),
         tooltip=[
@@ -709,10 +710,9 @@ def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
             alt.Tooltip("count:Q", title="Nb d'arrêts")
         ]
     ).properties(
-        title="Répartition avance/retard par minute (tous arrêts)"
+        title="Répartition avance/retard par minute (tous arrêts, borné à [-30, +30])"
     )
 
-    # Règle verticale en 0 pour repère avance/retard
     zero_rule = alt.Chart(pd.DataFrame({"delay_min": [0]})).mark_rule(
         color="black", strokeDash=[4, 4]
     ).encode(
@@ -915,4 +915,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
