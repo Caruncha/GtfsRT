@@ -8,8 +8,7 @@
 #   - GRAPHIQUES :
 #       * Anomalies (sans doublons)
 #       * Répartition des statuts des arrêts
-#       * Retard moyen GLOBAL vs schedule (sur l'ensemble des arrêts)
-# Retiré : téléchargements, détails par arrêt, autres graphiques.
+#       * Répartition par minute (avance/retard) vs schedule (tous arrêts, pas = 1 min)
 # Optimisé gros GTFS (filtrage par trips RT, lecture par chunks, dtypes compacts).
 # ---------------------------------------------------------
 # Dépendances :
@@ -58,7 +57,7 @@ TRIP_SCHED_REL = {0: "SCHEDULED", 1: "ADDED", 2: "UNSCHEDULED", 3: "CANCELED"}
 STOP_SCHED_REL = {0: "SCHEDULED", 1: "SKIPPED", 2: "NO_DATA"}
 
 # Timezone locale pour convertir start_date + HH:MM:SS (Montréal)
-TIMEZONE = "America/Toronto"  # couvre Montréal avec le DST
+TIMEZONE = "America/Toronto"  # couvre Montréal avec DST
 
 
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -666,32 +665,38 @@ def chart_stop_status_distribution(rt_su: pd.DataFrame):
     return chart.interactive()
 
 
-def chart_mean_delay_global_vs_schedule(sched_vs_rt_with_delay: pd.DataFrame):
+def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
     """
-    Bar chart du retard moyen GLOBAL (vs schedule) sur l'ensemble des arrêts.
-    (Utilise delay_from_sched ; pas d'agrégation par route.)
+    Histogramme (pas 1 minute) de la répartition avance/retard vs schedule
+    sur l'ensemble des arrêts. delay_min = round(delay_from_sched / 60).
     """
     if not _HAS_ALTAIR or sched_vs_rt_with_delay.empty:
         return None
+
     df = sched_vs_rt_with_delay.copy()
     if "delay_from_sched" not in df.columns:
         return None
+
     df = df[pd.notna(df["delay_from_sched"])]
     if df.empty:
         return None
 
-    agg = pd.DataFrame({
-        "label": ["Global"],
-        "delay_from_sched": [float(df["delay_from_sched"].mean())]
-    })
+    # Arrondi à la minute la plus proche (négatifs gérés correctement)
+    df["delay_min"] = (df["delay_from_sched"].astype("float") / 60.0).round().astype("Int64")
 
-    chart = alt.Chart(agg).mark_bar().encode(
-        x=alt.X("label:N", title=""),
-        y=alt.Y("delay_from_sched:Q", title="Retard moyen vs schedule (s)"),
-        color=alt.Color("delay_from_sched:Q", scale=alt.Scale(scheme="redyellowgreen", reverse=True), legend=None),
-        tooltip=[alt.Tooltip("delay_from_sched:Q", title="Retard moyen (s)", format=".1f")]
-    ).properties(title="Retard moyen GLOBAL vs schedule (tous arrêts)")
-    return chart.interactive()
+    # Agrégation par minute entière
+    agg = df.groupby("delay_min", as_index=False).size().rename(columns={"size": "count"})
+
+    # Histogramme + ligne verticale à 0 (on-time)
+    bars = alt.Chart(agg).mark_bar().encode(
+        x=alt.X("delay_min:Q", title="Délai vs schedule (minutes) — avance < 0 | retard > 0"),
+        y=alt.Y("count:Q", title="Nombre d'arrêts"),
+        tooltip=[alt.Tooltip("delay_min:Q", title="Minute"), alt.Tooltip("count:Q", title="Nb d'arrêts")]
+    ).properties(title="Répartition avance/retard par minute (tous arrêts)")
+
+    zero_rule = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="black", strokeDash=[4,4]).encode(x="x:Q")
+
+    return (bars + zero_rule).interactive()
 
 
 # ---------------------------------------------
@@ -699,7 +704,7 @@ def chart_mean_delay_global_vs_schedule(sched_vs_rt_with_delay: pd.DataFrame):
 # ---------------------------------------------
 def main():
     st.title("🚌 Analyse GTFS-RT TripUpdates vs GTFS (simplifiée + graphiques)")
-    st.caption("Synthèse, résumé, anomalies & graphiques (anomalies, statuts d'arrêts, retard moyen global vs schedule). Optimisée pour gros GTFS.")
+    st.caption("Synthèse, résumé, anomalies & graphiques (anomalies, statuts d'arrêts, répartition par minute vs schedule). Optimisée pour gros GTFS.")
 
     with st.sidebar:
         st.header("Fichiers d'entrée")
@@ -722,7 +727,6 @@ def main():
     if not gtfs_zip or not rt_file:
         st.error("Merci de fournir le **GTFS statique (.zip)** et le **TripUpdate (.pb/.bin/.json)**.")
         return
-
     # Lecture bytes
     gtfs_bytes = gtfs_zip.getvalue() if hasattr(gtfs_zip, "getvalue") else gtfs_zip.read()
     rt_bytes = rt_file.getvalue() if hasattr(rt_file, "getvalue") else rt_file.read()
@@ -790,7 +794,6 @@ def main():
         known_trip_ids = set(trips_df["trip_id"].dropna().astype(str))
         unknown_trip_ids = sorted(tid for tid in rt_trip_ids if tid not in known_trip_ids)
     else:
-        # Si on n'a pas pu charger trips.txt filtré, on ne peut pas déterminer (affichera 0 et liste vide)
         unknown_trip_ids = []
 
     skipped_total = int((rt_su["stop_status"] == "SKIPPED").sum()) if (not rt_su.empty and "stop_status" in rt_su.columns) else 0
@@ -862,11 +865,12 @@ def main():
             else:
                 st.info("Aucun statut d'arrêt exploitable.")
 
-        ch3 = chart_mean_delay_global_vs_schedule(sched_vs_rt)
+        # Nouveau : répartition par minute (avance/retard) globale
+        ch3 = chart_delay_distribution_per_minute(sched_vs_rt)
         if ch3 is not None:
             st.altair_chart(ch3, use_container_width=True)
         else:
-            st.info("Impossible de calculer le retard moyen global vs schedule (données manquantes).")
+            st.info("Impossible de calculer la répartition par minute (données manquantes).")
 
     # Debug
     if show_raw_tables:
