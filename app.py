@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import io
+import math
 import gc
 import zipfile
 from typing import Dict, List, Optional, Set, Tuple
@@ -669,6 +670,8 @@ def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
     """
     Histogramme (pas 1 minute) de la répartition avance/retard vs schedule
     sur l'ensemble des arrêts. delay_min = round(delay_from_sched / 60).
+    L'axe X est recentré/contraint entre l'avance max (min) et le retard max (max)
+    trouvés dans le feed, au pas de la minute.
     """
     if not _HAS_ALTAIR or sched_vs_rt_with_delay.empty:
         return None
@@ -681,20 +684,40 @@ def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
     if df.empty:
         return None
 
-    # Arrondi à la minute la plus proche (négatifs gérés correctement)
-    df["delay_min"] = (df["delay_from_sched"].astype("float") / 60.0).round().astype("Int64")
+    # -- Bornes exactes en minutes :
+    #    * avance max = min_sec -> floor(min_sec/60)
+    #    * retard max = max_sec -> ceil(max_sec/60)
+    min_sec = float(df["delay_from_sched"].min())
+    max_sec = float(df["delay_from_sched"].max())
+    min_min = math.floor(min_sec / 60.0)
+    max_min = math.ceil(max_sec / 60.0)
 
-    # Agrégation par minute entière
+    # Binning à la minute (discrétisation) pour l'histogramme
+    df["delay_min"] = (df["delay_from_sched"].astype("float") / 60.0).round().astype("Int64")
     agg = df.groupby("delay_min", as_index=False).size().rename(columns={"size": "count"})
 
-    # Histogramme + ligne verticale à 0 (on-time)
+    # Histogramme limité exactement aux extrêmes observés
     bars = alt.Chart(agg).mark_bar().encode(
-        x=alt.X("delay_min:Q", title="Délai vs schedule (minutes) — avance < 0 | retard > 0"),
+        x=alt.X(
+            "delay_min:Q",
+            title="Délai vs schedule (minutes) — avance < 0 | retard > 0",
+            scale=alt.Scale(domain=[min_min, max_min], nice=False, zero=False),
+        ),
         y=alt.Y("count:Q", title="Nombre d'arrêts"),
-        tooltip=[alt.Tooltip("delay_min:Q", title="Minute"), alt.Tooltip("count:Q", title="Nb d'arrêts")]
-    ).properties(title="Répartition avance/retard par minute (tous arrêts)")
+        tooltip=[
+            alt.Tooltip("delay_min:Q", title="Minute"),
+            alt.Tooltip("count:Q", title="Nb d'arrêts")
+        ]
+    ).properties(
+        title="Répartition avance/retard par minute (tous arrêts)"
+    )
 
-    zero_rule = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="black", strokeDash=[4,4]).encode(x="x:Q")
+    # Règle verticale en 0 pour repère avance/retard
+    zero_rule = alt.Chart(pd.DataFrame({"delay_min": [0]})).mark_rule(
+        color="black", strokeDash=[4, 4]
+    ).encode(
+        x=alt.X("delay_min:Q")
+    )
 
     return (bars + zero_rule).interactive()
 
@@ -892,3 +915,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
