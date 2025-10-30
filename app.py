@@ -1,12 +1,13 @@
 # app.py
 # ---------------------------------------------------------
 # Streamlit - Analyse GTFS-RT TripUpdates vs GTFS statique
-# Optimisé pour gros GTFS (filtrage par trips RT), avec:
-# - Détection voyages: ADDED / CANCELED / UNSCHEDULED / DELETED
-# - Détection arrêts: SKIPPED / NO_DATA
-# - Représentations graphiques Altair (délai par stop_sequence,
-#   histogrammes, compteurs par route)
-# - Téléchargements CSV
+# Optimisé gros GTFS avec filtrage par trips RT.
+# Ajouts demandés:
+#   - Synthèse: "Voyages totalement annulés (CANCELED)",
+#               "Voyages partiellement annulés (≥1 SKIPPED)"
+#   - Graphique Altair: nb d'arrêts SKIPPED par tranche de 10 minutes
+#   - Tableau d'anomalies: stop_id inconnu, séquence impossible,
+#                          arrivée < départ (RT), autres aberrations
 # ---------------------------------------------------------
 # Dépendances:
 #   pip install streamlit pandas altair gtfs-realtime-bindings protobuf
@@ -17,8 +18,7 @@ from __future__ import annotations
 import io
 import gc
 import zipfile
-import hashlib
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -27,6 +27,7 @@ import streamlit as st
 try:
     import altair as alt
     _HAS_ALTAIR = True
+    alt.data_transformers.disable_max_rows()
 except Exception:
     _HAS_ALTAIR = False
 
@@ -51,20 +52,8 @@ st.set_page_config(
 # Constantes / utilitaires
 # ---------------------------------------------
 
-TRIP_SCHED_REL = {
-    0: "SCHEDULED",
-    1: "ADDED",
-    2: "UNSCHEDULED",
-    3: "CANCELED",
-}
-STOP_SCHED_REL = {
-    0: "SCHEDULED",
-    1: "SKIPPED",
-    2: "NO_DATA",
-}
-
-def _bytes_hash(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
+TRIP_SCHED_REL = {0: "SCHEDULED", 1: "ADDED", 2: "UNSCHEDULED", 3: "CANCELED"}
+STOP_SCHED_REL = {0: "SCHEDULED", 1: "SKIPPED", 2: "NO_DATA"}
 
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.select_dtypes(include=["object", "string"]).columns:
@@ -116,12 +105,7 @@ def _read_csv_from_zip_filtered(
     frames: List[pd.DataFrame] = []
     with zf.open(member, "r") as fb:
         text = io.TextIOWrapper(fb, encoding="utf-8", newline="")
-        reader = pd.read_csv(
-            text,
-            usecols=usecols,
-            dtype=dtypes,
-            chunksize=chunksize
-        )
+        reader = pd.read_csv(text, usecols=usecols, dtype=dtypes, chunksize=chunksize)
         for chunk in reader:
             chunk = _normalize_cols(chunk)
             if filter_col and filter_values is not None and filter_col in chunk.columns:
@@ -131,7 +115,8 @@ def _read_csv_from_zip_filtered(
                 for m in missing:
                     chunk[m] = pd.NA
                 chunk = chunk[keep_order_cols]
-            frames.append(chunk)
+            if len(chunk):
+                frames.append(chunk)
 
     df = _safe_concat(frames)
     return df
@@ -145,10 +130,10 @@ def _read_csv_from_zip_filtered(
 def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, Set[str]]:
     """
     Parse TripUpdates (protobuf ou JSON) et retourne:
-      - rt_trips: une ligne par trip (trip_id, route_id, start_date, start_time, timestamp, trip_status, is_deleted)
-      - rt_stop_updates: une ligne par arrêt (trip_id, stop_id, stop_sequence, arrival_time, departure_time,
+      - rt_trips: par trip (trip_id, route_id, start_date, start_time, timestamp, trip_status, is_deleted)
+      - rt_stop_updates: par arrêt (trip_id, stop_id, stop_sequence, arrival_time, departure_time,
                           arrival_delay, departure_delay, stop_status)
-      - rt_trip_ids: set de trip_id
+      - rt_trip_ids: set des trip_id
     """
     rt_trips_records: List[Dict] = []
     rt_su_records: List[Dict] = []
@@ -172,7 +157,6 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
                 ts = getattr(tu, "timestamp", 0)
                 is_deleted = getattr(entity, "is_deleted", False)
 
-                # Trip schedule_relationship
                 trip_sr_num = getattr(trip, "schedule_relationship", 0)
                 trip_status = TRIP_SCHED_REL.get(int(trip_sr_num), str(trip_sr_num))
 
@@ -207,7 +191,6 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
                     }
                     rt_su_records.append(su)
         except Exception:
-            # On essaiera JSON
             pass
 
     # --- JSON fallback ---
@@ -227,7 +210,6 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
                 ts = tu.get("timestamp")
                 is_deleted = bool(entity.get("is_deleted", False))
 
-                # schedule_relationship num ou string
                 sr = trip.get("schedule_relationship", 0)
                 try:
                     srnum = int(sr)
@@ -251,12 +233,12 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
                 for stu in tu.get("stop_time_update", []):
                     arr = stu.get("arrival", {}) or {}
                     dep = stu.get("departure", {}) or {}
-                    sr = stu.get("schedule_relationship", 0)
+                    srs = stu.get("schedule_relationship", 0)
                     try:
-                        srnum = int(sr)
-                        stop_status = STOP_SCHED_REL.get(srnum, str(sr))
+                        srsn = int(srs)
+                        stop_status = STOP_SCHED_REL.get(srsn, str(srs))
                     except Exception:
-                        stop_status = str(sr)
+                        stop_status = str(srs)
 
                     su = {
                         "trip_id": trip_id,
@@ -280,9 +262,8 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
         for c in ["trip_id", "route_id", "start_date", "start_time", "trip_status"]:
             if c in rt_trips:
                 rt_trips[c] = rt_trips[c].astype("string")
-        for c in ["rt_timestamp"]:
-            if c in rt_trips:
-                rt_trips[c] = pd.to_numeric(rt_trips[c], errors="coerce").astype("Int64")
+        if "rt_timestamp" in rt_trips:
+            rt_trips["rt_timestamp"] = pd.to_numeric(rt_trips["rt_timestamp"], errors="coerce").astype("Int64")
         if "is_deleted" in rt_trips:
             rt_trips["is_deleted"] = rt_trips["is_deleted"].astype("boolean")
 
@@ -294,7 +275,7 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
             if c in rt_su:
                 rt_su[c] = pd.to_numeric(rt_su[c], errors="coerce").astype("Int64")
 
-    return rt_trips, rt_su, rt_trip_ids
+    return rt_trips, rt_su, set(rt_trips["trip_id"].dropna().astype(str).unique()) if not rt_trips.empty else set()
 
 
 # ---------------------------------------------
@@ -304,15 +285,12 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
 @st.cache_data(show_spinner=False)
 def load_trips_filtered(gtfs_zip_bytes: bytes, keep_trip_ids: Set[str]) -> pd.DataFrame:
     usecols = ["route_id", "service_id", "trip_id", "trip_headsign", "direction_id", "shape_id"]
-    dtypes = {
-        "route_id": "string", "service_id": "string", "trip_id": "string",
-        "trip_headsign": "string", "direction_id": "Int64", "shape_id": "string",
-    }
+    dtypes = {"route_id": "string", "service_id": "string", "trip_id": "string",
+              "trip_headsign": "string", "direction_id": "Int64", "shape_id": "string"}
     if not keep_trip_ids:
         return pd.DataFrame(columns=usecols)
     return _read_csv_from_zip_filtered(
-        gtfs_zip_bytes, "trips.txt",
-        usecols=usecols, dtypes=dtypes,
+        gtfs_zip_bytes, "trips.txt", usecols=usecols, dtypes=dtypes,
         filter_col="trip_id", filter_values=keep_trip_ids,
         chunksize=200_000, keep_order_cols=usecols
     )
@@ -320,15 +298,12 @@ def load_trips_filtered(gtfs_zip_bytes: bytes, keep_trip_ids: Set[str]) -> pd.Da
 @st.cache_data(show_spinner=False)
 def load_stop_times_filtered(gtfs_zip_bytes: bytes, keep_trip_ids: Set[str]) -> pd.DataFrame:
     usecols = ["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"]
-    dtypes = {
-        "trip_id": "string", "arrival_time": "string", "departure_time": "string",
-        "stop_id": "string", "stop_sequence": "Int64",
-    }
+    dtypes = {"trip_id": "string", "arrival_time": "string", "departure_time": "string",
+              "stop_id": "string", "stop_sequence": "Int64"}
     if not keep_trip_ids:
         return pd.DataFrame(columns=usecols)
     return _read_csv_from_zip_filtered(
-        gtfs_zip_bytes, "stop_times.txt",
-        usecols=usecols, dtypes=dtypes,
+        gtfs_zip_bytes, "stop_times.txt", usecols=usecols, dtypes=dtypes,
         filter_col="trip_id", filter_values=keep_trip_ids,
         chunksize=400_000, keep_order_cols=usecols
     )
@@ -340,8 +315,7 @@ def load_stops_filtered(gtfs_zip_bytes: bytes, keep_stop_ids: Set[str]) -> pd.Da
     if not keep_stop_ids:
         return pd.DataFrame(columns=usecols)
     return _read_csv_from_zip_filtered(
-        gtfs_zip_bytes, "stops.txt",
-        usecols=usecols, dtypes=dtypes,
+        gtfs_zip_bytes, "stops.txt", usecols=usecols, dtypes=dtypes,
         filter_col="stop_id", filter_values=keep_stop_ids,
         chunksize=200_000, keep_order_cols=usecols
     )
@@ -353,8 +327,7 @@ def load_routes_filtered(gtfs_zip_bytes: bytes, keep_route_ids: Set[str]) -> pd.
     if not keep_route_ids:
         return pd.DataFrame(columns=usecols)
     return _read_csv_from_zip_filtered(
-        gtfs_zip_bytes, "routes.txt",
-        usecols=usecols, dtypes=dtypes,
+        gtfs_zip_bytes, "routes.txt", usecols=usecols, dtypes=dtypes,
         filter_col="route_id", filter_values=keep_route_ids,
         chunksize=200_000, keep_order_cols=usecols
     )
@@ -399,7 +372,7 @@ def compute_schedule_vs_rt(
 ) -> pd.DataFrame:
     """
     Jointure RT vs schedule par arrêt. Clés: (trip_id, stop_id) sinon fallback (trip_id, stop_sequence).
-    Ajoute seconds planifiées et libellé d'arrêt.
+    Ajoute secondes planifiées et libellé d'arrêt + delay_best.
     """
     if rt_stop_updates.empty or stop_times_filtered.empty:
         return pd.DataFrame()
@@ -430,7 +403,7 @@ def compute_schedule_vs_rt(
         if c in merged.columns:
             merged[c] = merged[c].astype("Int64")
 
-    # Délai "best" (priorise arrival puis departure)
+    # Délai "best"
     if "arrival_delay" in merged.columns and "departure_delay" in merged.columns:
         merged["delay_best"] = merged[["arrival_delay", "departure_delay"]].bfill(axis=1).iloc[:, 0]
         merged["delay_best"] = pd.to_numeric(merged["delay_best"], errors="coerce").astype("Int64")
@@ -445,13 +418,11 @@ def summarize_trips(
     routes_df: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Résumé par trip: statut (ADDED/CANCELED/...), nb updates, nb SKIPPED / NO_DATA,
-    stats de délai (moyenne, max, min).
+    Résumé par trip: statut, nb updates, nb SKIPPED / NO_DATA, stats de délai.
     """
     if rt_trips.empty:
         return pd.DataFrame()
 
-    # Agrégations stop-level
     agg = pd.DataFrame({"trip_id": rt_trips["trip_id"].unique()})
     if not rt_stop_updates.empty:
         su = rt_stop_updates.copy()
@@ -469,20 +440,16 @@ def summarize_trips(
     out = pd.merge(rt_trips, agg, on="trip_id", how="left")
     if not trips_df.empty:
         out = pd.merge(
-            out,
-            trips_df[["trip_id", "route_id", "trip_headsign", "direction_id"]],
+            out, trips_df[["trip_id", "route_id", "trip_headsign", "direction_id"]],
             on="trip_id", how="left", suffixes=("", "_sched")
         )
-    # route info
     if not routes_df.empty and "route_id" in out.columns:
         out = pd.merge(out, routes_df, on="route_id", how="left")
 
-    # Nettoyage types
     for c in ["avg_delay_sec", "max_delay_sec", "min_delay_sec"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").round(1)
 
-    # Colonnes utiles en tête
     prefer = [
         "trip_id","route_id","route_short_name","route_long_name","trip_headsign","direction_id",
         "trip_status","is_deleted","updates_count","skipped_stops","nodata_stops",
@@ -490,29 +457,199 @@ def summarize_trips(
     ]
     cols = [c for c in prefer if c in out.columns] + [c for c in out.columns if c not in prefer]
     out = out[cols]
-
     return out
+
+
+# ---------------------------------------------
+# Anomalies
+# ---------------------------------------------
+
+def detect_anomalies(
+    rt_stop_updates: pd.DataFrame,
+    stops_df: pd.DataFrame,
+    stop_times_df: pd.DataFrame,
+    sched_vs_rt: pd.DataFrame,
+    extreme_delay_threshold: int = 7200  # 2h
+) -> pd.DataFrame:
+    """
+    Retourne un tableau d'anomalies standardisé:
+      - stop_id inconnu
+      - séquence impossible (non strictement croissante / duplications)
+      - arrivée < départ (dans RT)
+      - autres: clé schedule manquante pour SCHEDULED, stop_sequence manquant pour SCHEDULED,
+                delays extrêmes
+    Colonnes: anomaly_type, trip_id, stop_id, stop_sequence, details
+    """
+    anomalies: List[Dict] = []
+
+    # Set de stops connus
+    known_stops: Set[str] = set()
+    if stops_df is not None and not stops_df.empty and "stop_id" in stops_df:
+        known_stops = set(stops_df["stop_id"].dropna().astype(str).unique())
+
+    su = rt_stop_updates.copy()
+
+    # -- stop_id inconnu --
+    if "stop_id" in su.columns and known_stops:
+        mask_unknown = ~su["stop_id"].isin(known_stops)
+        for _, r in su[mask_unknown].iterrows():
+            anomalies.append({
+                "anomaly_type": "stop_id_inconnu",
+                "trip_id": r.get("trip_id"),
+                "stop_id": r.get("stop_id"),
+                "stop_sequence": r.get("stop_sequence"),
+                "details": "stop_id absent de stops.txt"
+            })
+
+    # -- séquence impossible: non strictement croissante ou duplicated --
+    if "stop_sequence" in su.columns:
+        su_seq = su.dropna(subset=["trip_id", "stop_sequence"]).copy()
+        su_seq["stop_sequence"] = pd.to_numeric(su_seq["stop_sequence"], errors="coerce")
+        su_seq = su_seq.dropna(subset=["stop_sequence"])
+        # detect duplicates and non-increasing
+        su_seq = su_seq.sort_values(["trip_id", "stop_sequence"])
+        # duplicates
+        dup_mask = su_seq.duplicated(subset=["trip_id", "stop_sequence"], keep=False)
+        for _, r in su_seq[dup_mask].iterrows():
+            anomalies.append({
+                "anomaly_type": "sequence_impossible",
+                "trip_id": r.get("trip_id"),
+                "stop_id": r.get("stop_id"),
+                "stop_sequence": r.get("stop_sequence"),
+                "details": "stop_sequence dupliqué pour ce trip"
+            })
+        # non-increasing within original order
+        su_order = su.dropna(subset=["trip_id", "stop_sequence"]).copy()
+        su_order["stop_sequence"] = pd.to_numeric(su_order["stop_sequence"], errors="coerce")
+        su_order = su_order.dropna(subset=["stop_sequence"])
+        su_order["prev_seq"] = su_order.groupby("trip_id")["stop_sequence"].shift(1)
+        bad_seq = su_order[(su_order["prev_seq"].notna()) & (su_order["stop_sequence"] <= su_order["prev_seq"])]
+        for _, r in bad_seq.iterrows():
+            anomalies.append({
+                "anomaly_type": "sequence_impossible",
+                "trip_id": r.get("trip_id"),
+                "stop_id": r.get("stop_id"),
+                "stop_sequence": r.get("stop_sequence"),
+                "details": f"stop_sequence non croissante (prev={int(r['prev_seq'])}, curr={int(r['stop_sequence'])})"
+            })
+
+    # -- arrivée < départ (RT) (selon demande) --
+    if "arrival_time" in su.columns and "departure_time" in su.columns:
+        su_time = su.dropna(subset=["arrival_time", "departure_time"]).copy()
+        su_time = su_time[(su_time["arrival_time"].astype("Int64").notna()) &
+                          (su_time["departure_time"].astype("Int64").notna())]
+        bad_time = su_time[su_time["arrival_time"] < su_time["departure_time"]]
+        for _, r in bad_time.iterrows():
+            anomalies.append({
+                "anomaly_type": "arrivee_inferieure_depart_RT",
+                "trip_id": r.get("trip_id"),
+                "stop_id": r.get("stop_id"),
+                "stop_sequence": r.get("stop_sequence"),
+                "details": f"arrival_time({r.get('arrival_time')}) < departure_time({r.get('departure_time')})"
+            })
+
+    # -- autres aberrations --
+    #  a) SCHEDULED sans correspondance schedule (dans jointure)
+    if sched_vs_rt is not None and not sched_vs_rt.empty:
+        sched_missing = sched_vs_rt[
+            (sched_vs_rt.get("stop_status") == "SCHEDULED") &
+            (sched_vs_rt.get("arrival_time_sec").isna()) &
+            (sched_vs_rt.get("departure_time_sec").isna())
+        ]
+        for _, r in sched_missing.iterrows():
+            anomalies.append({
+                "anomaly_type": "cle_schedule_introuvable",
+                "trip_id": r.get("trip_id"),
+                "stop_id": r.get("stop_id"),
+                "stop_sequence": r.get("stop_sequence"),
+                "details": "Aucune ligne correspondante dans stop_times pour (trip_id, stop_id/seq)"
+            })
+
+    #  b) stop_sequence manquant pour SCHEDULED
+    if "stop_status" in su.columns:
+        missing_seq = su[(su["stop_status"] == "SCHEDULED") & (su.get("stop_sequence").isna())]
+        for _, r in missing_seq.iterrows():
+            anomalies.append({
+                "anomaly_type": "stop_sequence_manquant",
+                "trip_id": r.get("trip_id"),
+                "stop_id": r.get("stop_id"),
+                "stop_sequence": r.get("stop_sequence"),
+                "details": "stop_sequence manquant pour un arrêt SCHEDULED"
+            })
+
+    #  c) delays extrêmes (abs(delay_best) > seuil)
+    if sched_vs_rt is not None and not sched_vs_rt.empty and "delay_best" in sched_vs_rt.columns:
+        extreme = sched_vs_rt[sched_vs_rt["delay_best"].abs() > extreme_delay_threshold]
+        for _, r in extreme.iterrows():
+            anomalies.append({
+                "anomaly_type": "retard_extreme",
+                "trip_id": r.get("trip_id"),
+                "stop_id": r.get("stop_id"),
+                "stop_sequence": r.get("stop_sequence"),
+                "details": f"delay_best={r.get('delay_best')}s > {extreme_delay_threshold}s"
+            })
+
+    # Build dataframe
+    if not anomalies:
+        return pd.DataFrame(columns=["anomaly_type","trip_id","stop_id","stop_sequence","details"])
+
+    df = pd.DataFrame(anomalies)
+    # Types
+    for c in ["trip_id","stop_id","anomaly_type","details"]:
+        if c in df.columns:
+            df[c] = df[c].astype("string")
+    if "stop_sequence" in df.columns:
+        df["stop_sequence"] = pd.to_numeric(df["stop_sequence"], errors="coerce").astype("Int64")
+    return df
 
 
 # ---------------------------------------------
 # Graphiques Altair
 # ---------------------------------------------
 
+def _route_label(df: pd.DataFrame) -> pd.Series:
+    if "route_short_name" in df.columns:
+        lbl = df["route_short_name"].fillna(df.get("route_long_name"))
+    else:
+        lbl = df.get("route_long_name", pd.Series([""]*len(df)))
+    lbl = lbl.fillna(df.get("route_id")).astype(str)
+    return lbl
+def chart_skipped_by_10min(rt_su: pd.DataFrame):
+    """
+    Bar chart: nombre d'arrêts SKIPPED par tranche de 10 minutes (UTC),
+    basé sur arrival_time/ departure_time RT (epoch).
+    """
+    if not _HAS_ALTAIR or rt_su.empty:
+        return None
+    df = rt_su[rt_su.get("stop_status") == "SKIPPED"].copy()
+    if df.empty:
+        return None
+    df["rt_time"] = df[["arrival_time","departure_time"]].bfill(axis=1).iloc[:,0]
+    df = df[pd.notna(df["rt_time"])]
+    if df.empty:
+        return None
+    df["rt_dt"] = pd.to_datetime(df["rt_time"].astype("float"), unit="s", utc=True, errors="coerce")
+    df = df[pd.notna(df["rt_dt"])]
+    if df.empty:
+        return None
+    df["bucket_10m"] = df["rt_dt"].dt.floor("10min")
+    agg = df.groupby("bucket_10m", as_index=False).size().rename(columns={"size":"skipped_count"})
+
+    chart = alt.Chart(agg).mark_bar().encode(
+        x=alt.X("bucket_10m:T", title="Heure (UTC) par tranches de 10 minutes"),
+        y=alt.Y("skipped_count:Q", title="Nombre d'arrêts SKIPPED"),
+        tooltip=[alt.Tooltip("bucket_10m:T", title="Tranche 10 min"), alt.Tooltip("skipped_count:Q", title="SKIPPED")]
+    ).properties(title="Arrêts SKIPPED par tranche de 10 minutes")
+    return chart.interactive()
+
 def chart_trip_delays(det: pd.DataFrame, trip_id: str):
-    """
-    Courbe des délais (arrival/departure) par stop_sequence pour un trip.
-    Points: status (SKIPPED/NO_DATA).
-    """
+    """Courbe des délais (delay_best) par stop_sequence + points SKIPPED/NO_DATA."""
     if not _HAS_ALTAIR or det.empty:
         return None
-
     df = det.copy()
-    # axis x: stop_sequence (si manquant, fallback index)
     if "stop_sequence" not in df.columns or df["stop_sequence"].isna().all():
         df = df.reset_index().rename(columns={"index": "stop_sequence"})
     df["stop_sequence"] = pd.to_numeric(df["stop_sequence"], errors="coerce")
-
-    # delay_best (préféré)
     if "delay_best" not in df.columns:
         df["delay_best"] = df[["arrival_delay","departure_delay"]].bfill(axis=1).iloc[:,0]
 
@@ -527,59 +664,34 @@ def chart_trip_delays(det: pd.DataFrame, trip_id: str):
             alt.Tooltip("departure_delay:Q", title="Dep delay (s)"),
         ],
     )
-
     line = base.mark_line(point=True).encode(
         y=alt.Y("delay_best:Q", title="Délai (s)"),
-        color=alt.condition(
-            alt.datum.delay_best > 0,
-            alt.value("#d62728"),  # rouge retard
-            alt.value("#2ca02c")   # vert avance/à l'heure
-        )
-    ).properties(
-        title=f"Delais par arrêt — Trip {trip_id}"
-    )
-
-    # Points pour SKIPPED/NO_DATA
-    pts = base.mark_point(filled=True, size=90, shape="triangle-up").encode(
+        color=alt.condition(alt.datum.delay_best > 0, alt.value("#d62728"), alt.value("#2ca02c"))
+    ).properties(title=f"Delais par arrêt — Trip {trip_id}")
+    pts = base.mark_point(filled=True, size=90).encode(
         y="delay_best:Q",
-        color=alt.condition(
-            alt.FieldEqualPredicate("stop_status", "SKIPPED"),
-            alt.value("#1f77b4"),
-            alt.value("#9467bd")
-        ),
-        shape=alt.Shape("stop_status:N", scale=alt.Scale(domain=["SKIPPED","NO_DATA"], range=["triangle-up","diamond"])),
+        color=alt.Color("stop_status:N", scale=alt.Scale(domain=["SKIPPED","NO_DATA"], range=["#1f77b4","#9467bd"]), legend=alt.Legend(title="Stop status")),
         opacity=alt.condition(alt.FieldOneOfPredicate("stop_status", ["SKIPPED","NO_DATA"]), alt.value(1), alt.value(0))
     )
-
     return (line + pts).interactive()
 
 def chart_avg_delay_by_route(summary_df: pd.DataFrame):
-    if not _HAS_ALTAIR or summary_df.empty:
+    if not _HAS_ALTAIR or summary_df.empty or "avg_delay_sec" not in summary_df:
         return None
     df = summary_df.copy()
-    # Label route
-    if "route_short_name" in df.columns:
-        df["route_label"] = df["route_short_name"].fillna(df.get("route_long_name"))
-    else:
-        df["route_label"] = df.get("route_long_name", pd.Series([""]*len(df)))
-    df["route_label"] = df["route_label"].fillna(df["route_id"]).astype(str)
-
+    df["route_label"] = _route_label(df)
     chart = alt.Chart(df).mark_bar().encode(
         x=alt.X("route_label:N", title="Route", sort="-y"),
         y=alt.Y("mean(avg_delay_sec):Q", title="Retard moyen (s)"),
-        tooltip=[
-            alt.Tooltip("route_label:N", title="Route"),
-            alt.Tooltip("mean(avg_delay_sec):Q", title="Retard moyen (s)", format=".1f"),
-            alt.Tooltip("count():Q", title="Nb trips"),
-        ],
+        tooltip=[alt.Tooltip("route_label:N", title="Route"),
+                 alt.Tooltip("mean(avg_delay_sec):Q", title="Retard moyen (s)", format=".1f"),
+                 alt.Tooltip("count():Q", title="Nb trips")],
         color=alt.Color("mean(avg_delay_sec):Q", scale=alt.Scale(scheme="redyellowgreen", reverse=True), legend=None),
-    ).properties(
-        title="Retard moyen par route"
-    )
+    ).properties(title="Retard moyen par route")
     return chart.interactive()
 
 def chart_trip_status_counts(summary_df: pd.DataFrame):
-    if not _HAS_ALTAIR or summary_df.empty:
+    if not _HAS_ALTAIR or summary_df.empty or "trip_status" not in summary_df:
         return None
     df = summary_df.copy()
     chart = alt.Chart(df).mark_bar().encode(
@@ -587,9 +699,21 @@ def chart_trip_status_counts(summary_df: pd.DataFrame):
         y=alt.Y("count():Q", title="Nombre de voyages"),
         color="trip_status:N",
         tooltip=[alt.Tooltip("trip_status:N", title="Statut"), alt.Tooltip("count():Q", title="Nb")]
-    ).properties(
-        title="Comptes de voyages par statut (SCHEDULED/ADDED/CANCELED/...)"
-    )
+    ).properties(title="Comptes de voyages par statut")
+    return chart.interactive()
+
+def chart_delay_distribution(rt_su: pd.DataFrame):
+    """Histogramme global des delays (delay_best)."""
+    if not _HAS_ALTAIR or rt_su.empty:
+        return None
+    df = rt_su.copy()
+    df["delay_best"] = df[["arrival_delay","departure_delay"]].bfill(axis=1).iloc[:,0]
+    df = df[pd.notna(df["delay_best"])]
+    chart = alt.Chart(df).mark_bar().encode(
+        x=alt.X("delay_best:Q", bin=alt.Bin(maxbins=60), title="Délai (s)"),
+        y=alt.Y("count():Q", title="Occurrences"),
+        tooltip=[alt.Tooltip("count():Q", title="Occurrences")]
+    ).properties(title="Distribution des retards (tous arrêts)")
     return chart.interactive()
 
 
@@ -599,7 +723,7 @@ def chart_trip_status_counts(summary_df: pd.DataFrame):
 
 def main():
     st.title("🚌 Analyse GTFS-RT TripUpdates vs GTFS (optimisée)")
-    st.caption("Inclut voyages ADDED/CANCELED, arrêts SKIPPED/NO_DATA et graphiques Altair. Lecture ciblée sur les trips RT pour gros GTFS (~70 Mo+).")
+    st.caption("Voyages ADDED/CANCELED, arrêts SKIPPED/NO_DATA, graphiques Altair et détection d'anomalies. Lecture ciblée sur les trips RT pour gros GTFS (~70 Mo+).")
 
     with st.sidebar:
         st.header("Fichiers d'entrée")
@@ -680,25 +804,27 @@ def main():
     st.success("Analyse terminée ✅")
 
     # -----------------------------
-    # KPIs
+    # Synthèse (tes deux indicateurs demandés en premier)
     # -----------------------------
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Trips dans RT", f"{rt_trips['trip_id'].nunique() if not rt_trips.empty else 0:,}")
-    with c2:
-        canceled = 0
+    canceled_total = int((rt_trips["trip_status"] == "CANCELED").sum()) if "trip_status" in rt_trips.columns else 0
+    partially_canceled = 0
+    if not rt_su.empty and "stop_status" in rt_su.columns:
+        trips_with_skipped = set(rt_su.loc[rt_su["stop_status"] == "SKIPPED", "trip_id"].dropna().astype(str))
         if "trip_status" in rt_trips.columns:
-            canceled = int((rt_trips["trip_status"] == "CANCELED").sum())
-        st.metric("Voyages annulés", f"{canceled:,}")
-    with c3:
-        added = 0
-        if "trip_status" in rt_trips.columns:
-            added = int((rt_trips["trip_status"] == "ADDED").sum())
-        st.metric("Voyages ajoutés", f"{added:,}")
-    with c4:
-        skipped = 0
-        if not rt_su.empty and "stop_status" in rt_su.columns:
-            skipped = int((rt_su["stop_status"] == "SKIPPED").sum())
+            not_canceled_trips = set(rt_trips.loc[rt_trips["trip_status"] != "CANCELED", "trip_id"].dropna().astype(str))
+            partially_canceled = len(trips_with_skipped & not_canceled_trips)
+        else:
+            partially_canceled = len(trips_with_skipped)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("Voyages totalement annulés (CANCELED)", f"{canceled_total:,}")
+    with k2:
+        st.metric("Voyages partiellement annulés (≥1 SKIPPED)", f"{partially_canceled:,}")
+    with k3:
+        st.metric("Trips RT", f"{rt_trips['trip_id'].nunique() if not rt_trips.empty else 0:,}")
+    with k4:
+        skipped = int((rt_su["stop_status"] == "SKIPPED").sum()) if (not rt_su.empty and "stop_status" in rt_su.columns) else 0
         st.metric("Arrêts SKIPPED", f"{skipped:,}")
 
     # -----------------------------
@@ -714,9 +840,7 @@ def main():
             "avg_delay_sec","max_delay_sec","min_delay_sec","start_date","start_time","rt_timestamp"
         ] if c in summary_df.columns]
         st.dataframe(
-            summary_df[order_cols].sort_values(
-                ["trip_status","route_id","trip_id"], na_position="last"
-            ),
+            summary_df[order_cols].sort_values(["trip_status","route_id","trip_id"], na_position="last"),
             use_container_width=True, height=360
         )
         csv = summary_df.to_csv(index=False).encode("utf-8")
@@ -751,29 +875,51 @@ def main():
         csvd = det.to_csv(index=False).encode("utf-8")
         st.download_button("Télécharger les détails (trip sélectionné)", data=csvd, file_name=f"details_trip_{selected_trip}.csv", mime="text/csv")
 
-        # -------------------------
-        # Graphiques Altair (trip)
-        # -------------------------
-        if enable_charts:
-            if not _HAS_ALTAIR:
-                st.warning("Altair n'est pas installé — `pip install altair` pour activer les graphiques.")
+    # -----------------------------
+    # Graphique demandé: SKIPPED par tranches de 10 minutes
+    # -----------------------------
+    st.subheader("Arrêts SKIPPED — agrégés par tranche de 10 minutes")
+    if enable_charts:
+        if not _HAS_ALTAIR:
+            st.warning("Altair n'est pas installé — `pip install altair` pour activer les graphiques.")
+        else:
+            ch_sk10 = chart_skipped_by_10min(rt_su)
+            if ch_sk10 is not None:
+                st.altair_chart(ch_sk10, use_container_width=True)
             else:
-                st.subheader("Visualisations")
-                ch1 = chart_trip_delays(det, selected_trip)
-                if ch1 is not None:
-                    st.altair_chart(ch1, use_container_width=True)
+                st.info("Aucun arrêt SKIPPED avec horodatage exploitable.")
 
-                # Graphiques globaux
-                ch2 = chart_avg_delay_by_route(summary_df)
-                ch3 = chart_trip_status_counts(summary_df)
-                if ch2 is not None or ch3 is not None:
-                    gcol1, gcol2 = st.columns(2)
-                    with gcol1:
-                        if ch2 is not None:
-                            st.altair_chart(ch2, use_container_width=True, theme=None)
-                    with gcol2:
-                        if ch3 is not None:
-                            st.altair_chart(ch3, use_container_width=True, theme=None)
+            # (On laisse aussi 2 graphiques globaux utiles)
+            g1, g2 = st.columns(2)
+            with g1:
+                ch_avg = chart_avg_delay_by_route(summary_df)
+                if ch_avg is not None:
+                    st.altair_chart(ch_avg, use_container_width=True)
+            with g2:
+                ch_stat = chart_trip_status_counts(summary_df)
+                if ch_stat is not None:
+                    st.altair_chart(ch_stat, use_container_width=True)
+
+            # Graphique trip-level (délai par arrêt) si un trip est sélectionné ci-dessus
+            if not sched_vs_rt.empty:
+                selected_trip_for_chart = det["trip_id"].iloc[0] if not det.empty else None
+                if selected_trip_for_chart:
+                    st.subheader(f"Delais par arrêt — Trip {selected_trip_for_chart}")
+                    ch_trip = chart_trip_delays(det, selected_trip_for_chart)
+                    if ch_trip is not None:
+                        st.altair_chart(ch_trip, use_container_width=True)
+
+    # -----------------------------
+    # Anomalies
+    # -----------------------------
+    st.subheader("Anomalies détectées")
+    anomalies_df = detect_anomalies(rt_su, stops_df, stop_times_df, sched_vs_rt)
+    if anomalies_df.empty:
+        st.success("Aucune anomalie détectée selon les règles en vigueur.")
+    else:
+        st.dataframe(anomalies_df, use_container_width=True, height=360)
+        csv_a = anomalies_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Télécharger les anomalies (CSV)", data=csv_a, file_name="anomalies_rt.csv", mime="text/csv")
 
     # Debug / Tables brutes
     if show_raw_tables:
