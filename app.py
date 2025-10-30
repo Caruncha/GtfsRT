@@ -664,14 +664,14 @@ def chart_stop_status_distribution(rt_su: pd.DataFrame):
         tooltip=[alt.Tooltip("stop_status:N", title="Statut"), alt.Tooltip("count:Q", title="Nb")]
     ).properties(title="Répartition des statuts des arrêts")
     return chart.interactive()
-
-
+    
 def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
     """
     Histogramme (pas 1 minute) de la répartition avance/retard vs schedule
-    sur l'ensemble des arrêts, limité à [-30, +30] minutes.
-    - Les données en dehors de cette plage sont EXCLUES du calcul (non considérées).
-    - delay_min = round(delay_from_sched / 60).
+    sur l'ensemble des arrêts, borné à [-30, +30] minutes.
+    - Les données en dehors de cette plage sont EXCLUES.
+    - On affiche toutes les minutes de -30 à +30, même sans occurrence.
+    - Les bacs à 0 sont fortement dé‑accentués (couleur/opacity).
     """
     if not _HAS_ALTAIR or sched_vs_rt_with_delay.empty:
         return None
@@ -680,8 +680,7 @@ def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
     if "delay_from_sched" not in df.columns:
         return None
 
-    # 1) Filtrer STRICTEMENT les arrêts dans [-30, +30] minutes sur la base des secondes,
-    #    pour éviter d'inclure par arrondi des valeurs comme 30.4 min.
+    # 1) Filtrer STRICTEMENT à [-30, +30] minutes (en secondes pour éviter l'effet d'arrondi)
     df = df[pd.notna(df["delay_from_sched"])]
     if df.empty:
         return None
@@ -691,20 +690,27 @@ def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
     if df.empty:
         return None
 
-    # 2) Discrétisation à la minute (arrondi à la minute la plus proche)
+    # 2) Discrétisation au pas de 1 minute (arrondi à la minute la plus proche)
     df["delay_min"] = (df["delay_from_sched"].astype("float") / 60.0).round().astype("Int64")
 
-    # 3) Agrégation
+    # 3) Agrégation + complétion de TOUTES les minutes [-30..30]
     agg = df.groupby("delay_min", as_index=False).size().rename(columns={"size": "count"})
+    full_range = pd.DataFrame({"delay_min": list(range(-30, 31))})
+    full = full_range.merge(agg, on="delay_min", how="left")
+    full["count"] = full["count"].fillna(0).astype("Int64")
+    full["is_zero"] = (full["count"] == 0)
 
-    # 4) Graphique : histogramme + règle verticale à 0, axe X figé sur [-30, +30]
-    bars = alt.Chart(agg).mark_bar().encode(
+    # 4) Graphique : barres avec dé‑accentuation pour les zéros + règle verticale à 0
+    bars = alt.Chart(full).mark_bar().encode(
         x=alt.X(
             "delay_min:Q",
             title="Délai vs schedule (minutes) — avance < 0 | retard > 0",
             scale=alt.Scale(domain=[-30, 30], nice=False, zero=False),
         ),
         y=alt.Y("count:Q", title="Nombre d'arrêts"),
+        # Dé‑accentuation visuelle des zéros
+        color=alt.condition("datum.is_zero", alt.value("#d3d3d3"), alt.value("#1f77b4")),
+        opacity=alt.condition("datum.is_zero", alt.value(0.25), alt.value(0.9)),
         tooltip=[
             alt.Tooltip("delay_min:Q", title="Minute"),
             alt.Tooltip("count:Q", title="Nb d'arrêts")
@@ -915,5 +921,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
