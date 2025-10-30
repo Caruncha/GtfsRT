@@ -13,7 +13,7 @@
 # Optimisé gros GTFS (filtrage par trips RT, lecture par chunks, dtypes compacts).
 # ---------------------------------------------------------
 # Dépendances :
-#   pip install streamlit pandas altair gtfs-realtime-bindings protobuf pytz
+#   pip install streamlit pandas altair gtfs-realtime-bindings protobuf
 # ---------------------------------------------------------
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ def _safe_concat(frames: List[pd.DataFrame]) -> pd.DataFrame:
 def _get_zip_member_case_insensitive(zf: zipfile.ZipFile, target: str) -> Optional[str]:
     lower_target = target.lower()
     for name in zf.namelist():
-        if name.lower().endswith("/" + lower_target) or name.lower() == lower_target:
+        if name.lower().endswith("/" + target.lower()) or name.lower() == target.lower():
             return name
     return None
 
@@ -392,7 +392,7 @@ def compute_schedule_vs_rt(
         if c in merged.columns:
             merged[c] = merged[c].astype("Int64")
 
-    # Délai "best" natif RT (utile pour anomalies, mais PAS pour le graphe demandé)
+    # Délai "best" natif RT (utile pour anomalies, mais PAS pour le graphe vs schedule)
     if "arrival_delay" in merged.columns and "departure_delay" in merged.columns:
         merged["delay_best"] = merged[["arrival_delay", "departure_delay"]].bfill(axis=1).iloc[:, 0]
         merged["delay_best"] = pd.to_numeric(merged["delay_best"], errors="coerce").astype("Int64")
@@ -422,7 +422,6 @@ def attach_schedule_based_delay(
         df["start_date"] = pd.NA
 
     # 2) Seconds planifiées (arrival_time_sec prioritaire, sinon departure_time_sec)
-    #    -> ces colonnes proviennent de stop_times.txt (côté _sched)
     sched_cols = [c for c in ["arrival_time_sec", "departure_time_sec"] if c in df.columns]
     if sched_cols:
         df["sched_sec"] = pd.to_numeric(df[sched_cols].bfill(axis=1).iloc[:, 0], errors="coerce")
@@ -432,31 +431,25 @@ def attach_schedule_based_delay(
     # 3) Datetime planifié local -> UTC
     start_local = pd.to_datetime(df["start_date"], format="%Y%m%d", errors="coerce")
     try:
-        # pandas >= 2.0 : gestion DST précise
         start_local = start_local.dt.tz_localize(timezone, nonexistent="shift_forward", ambiguous="NaT")
     except Exception:
-        # fallback générique
         start_local = start_local.dt.tz_localize(timezone, errors="coerce")
 
     sched_dt_local = start_local + pd.to_timedelta(df["sched_sec"], unit="s")
     try:
         sched_dt_utc = sched_dt_local.dt.tz_convert("UTC")
     except Exception:
-        # Si tz est déjà UTC ou NaT
         sched_dt_utc = sched_dt_local
 
     # 4) Datetime RT (epoch seconds -> UTC)
-    #    -> préfère arrival_time_rt puis arrival_time, puis departure_time_rt, puis departure_time
     rt_time_candidates = [c for c in ["arrival_time_rt", "arrival_time", "departure_time_rt", "departure_time"] if c in df.columns]
     if rt_time_candidates:
         rt_epoch = pd.to_numeric(df[rt_time_candidates].bfill(axis=1).iloc[:, 0], errors="coerce")
         df["rt_dt"] = pd.to_datetime(rt_epoch, unit="s", utc=True, errors="coerce")
     else:
-        # aucune colonne RT exploitable
         df["rt_dt"] = pd.NaT
 
     # 5) Différence (RT - Scheduled) en secondes
-    #    -> handle NaT proprement (résultat NaN -> Int64 NA)
     delta = (df["rt_dt"] - sched_dt_utc).dt.total_seconds()
     df["delay_from_sched"] = pd.to_numeric(delta, errors="coerce").round().astype("Int64")
 
@@ -754,7 +747,7 @@ def main():
         st.subheader("Options")
         focus_only_rt_trips = st.checkbox("Se focaliser sur les voyages du TripUpdate (recommandé)", value=True)
         limit_trips = st.number_input("Limiter à N trips (optionnel)", min_value=0, value=0, step=100)
-        show_raw_tables = st.checkbox("Afficher tables brutes (debug)", value=False)
+        show_raw_tables = st.checkbox("Afficher tables brutes (debug)", value=False)  # <-- défini UNE SEULE FOIS ici
 
         st.divider()
         run_btn = st.button("Lancer l'analyse", type="primary", use_container_width=True)
@@ -892,8 +885,7 @@ def main():
         else:
             st.info("Impossible de calculer les retards moyens vs schedule (données manquantes).")
 
-    # Debug
-    show_raw_tables = st.sidebar.checkbox("Afficher tables brutes (debug)", value=False)
+    # Debug (réutilise la variable définie une seule fois)
     if show_raw_tables:
         st.divider()
         st.subheader("Debug: tables brutes")
@@ -913,4 +905,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
