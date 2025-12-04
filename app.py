@@ -829,7 +829,7 @@ def main():
     skipped_total = int((rt_su["stop_status"] == "SKIPPED").sum()) if (not rt_su.empty and "stop_status" in rt_su.columns) else 0
     trips_count = rt_trips["trip_id"].nunique() if not rt_trips.empty else 0
 
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     with k1:
         st.metric("Voyages annulés (CANCELED)", f"{canceled_total:,}")
     with k2:
@@ -924,6 +924,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
