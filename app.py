@@ -54,7 +54,7 @@ st.set_page_config(
 # ---------------------------------------------
 # Constantes & utilitaires
 # ---------------------------------------------
-TRIP_SCHED_REL = {0: "SCHEDULED", 1: "ADDED", 2: "UNSCHEDULED", 3: "CANCELED"}
+TRIP_SCHED_REL = {0: "SCHEDULED", 1: "ADDED", 2: "UNSCHEDULED", 3: "CANCELED", 8: "NEW"}
 STOP_SCHED_REL = {0: "SCHEDULED", 1: "SKIPPED", 2: "NO_DATA"}
 
 # Timezone locale pour convertir start_date + HH:MM:SS (Montréal)
@@ -808,6 +808,7 @@ def main():
     # -----------------------------
     canceled_total = int((rt_trips["trip_status"] == "CANCELED").sum()) if "trip_status" in rt_trips.columns else 0
     added_total = int((rt_trips["trip_status"] == "ADDED").sum()) if "trip_status" in rt_trips.columns else 0
+    new_total = int((rt_trips["trip_status"] == "NEW").sum()) if "trip_status" in rt_trips.columns else 0
 
     partially_canceled = 0
     if not rt_su.empty and "stop_status" in rt_su.columns:
@@ -834,12 +835,14 @@ def main():
     with k2:
         st.metric("Voyages ajoutés (ADDED)", f"{added_total:,}")
     with k3:
-        st.metric("Voyages partiellement annulés (≥1 SKIPPED)", f"{partially_canceled:,}")
+        st.metric("Voyages ajoutés (NEW)", f"{new_total:,}")
     with k4:
-        st.metric("Trip IDs inconnus", f"{len(unknown_trip_ids):,}")
+        st.metric("Voyages partiellement annulés (≥1 SKIPPED)", f"{partially_canceled:,}")
     with k5:
-        st.metric("Trips RT", f"{trips_count:,}")
+        st.metric("Trip IDs inconnus", f"{len(unknown_trip_ids):,}")
     with k6:
+        st.metric("Trips RT", f"{trips_count:,}")
+    with k7:
         st.metric("Arrêts SKIPPED", f"{skipped_total:,}")
 
     if unknown_trip_ids:
@@ -921,6 +924,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
