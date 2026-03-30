@@ -106,9 +106,9 @@ def _load_api_config() -> dict:
     }
 
 
-def fetch_feed(url: str, cfg: dict) -> bytes:
+def fetch_feed(url: str, cfg: dict, no_auth: bool = False) -> bytes:
     """
-    Télécharge un flux depuis `url` en appliquant l'auth configurée.
+    Télécharge un flux depuis `url` en appliquant l'auth configurée (sauf si no_auth=True).
     Lève une exception en cas d'erreur HTTP ou réseau.
     """
     if not _HAS_REQUESTS:
@@ -119,13 +119,14 @@ def fetch_feed(url: str, cfg: dict) -> bytes:
     headers: Dict[str, str] = {}
     auth = None
 
-    if cfg.get("bearer_token"):
-        headers["Authorization"] = f"Bearer {cfg['bearer_token']}"
-    elif cfg.get("api_key"):
-        headers[cfg["api_key_header"]] = cfg["api_key"]
+    if not no_auth:
+        if cfg.get("bearer_token"):
+            headers["Authorization"] = f"Bearer {cfg['bearer_token']}"
+        elif cfg.get("api_key"):
+            headers[cfg["api_key_header"]] = cfg["api_key"]
 
-    if cfg.get("username"):
-        auth = (cfg["username"], cfg["password"])
+        if cfg.get("username"):
+            auth = (cfg["username"], cfg["password"])
 
     resp = _requests.get(url, headers=headers, auth=auth, timeout=cfg["timeout"])
     resp.raise_for_status()
