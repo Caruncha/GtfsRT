@@ -279,57 +279,63 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
     # JSON fallback
     if not rt_trips_records and not rt_su_records:
         import json
-        data = json.loads(rt_bytes.decode("utf-8"))
-        for entity in data.get("entity", []):
-            tu = entity.get("trip_update")
-            if not tu:
-                continue
-            trip = tu.get("trip", {}) or {}
-            trip_id = (trip.get("trip_id") or "").strip()
-            route_id = (trip.get("route_id") or "").strip()
-            start_date = (trip.get("start_date") or "").strip()
-            start_time = (trip.get("start_time") or "").strip()
-            ts = tu.get("timestamp")
-            is_deleted = bool(entity.get("is_deleted", False))
+        try:
+            # On tente de décoder en utf-8, si ça rate c'est que c'est du binaire pur non-JSON
+            decoded_data = rt_bytes.decode("utf-8", errors="ignore")
+            data = json.loads(decoded_data)
+            for entity in data.get("entity", []):
+                tu = entity.get("trip_update")
+                if not tu:
+                    continue
+                trip = tu.get("trip", {}) or {}
+                trip_id = (trip.get("trip_id") or "").strip()
+                route_id = (trip.get("route_id") or "").strip()
+                start_date = (trip.get("start_date") or "").strip()
+                start_time = (trip.get("start_time") or "").strip()
+                ts = tu.get("timestamp")
+                is_deleted = bool(entity.get("is_deleted", False))
 
-            sr = trip.get("schedule_relationship", 0)
-            try:
-                trip_sr = TRIP_SCHED_REL.get(int(sr), str(sr))
-            except Exception:
-                trip_sr = str(sr)
-
-            if trip_id:
-                rt_trip_ids.add(trip_id)
-
-            rt_trips_records.append({
-                "trip_id": trip_id,
-                "route_id": route_id,
-                "start_date": start_date,
-                "start_time": start_time,
-                "rt_timestamp": int(ts) if ts else pd.NA,
-                "trip_status": trip_sr,
-                "is_deleted": is_deleted,
-            })
-
-            for stu in tu.get("stop_time_update", []):
-                arr = stu.get("arrival", {}) or {}
-                dep = stu.get("departure", {}) or {}
-                srs = stu.get("schedule_relationship", 0)
+                sr = trip.get("schedule_relationship", 0)
                 try:
-                    stop_sr = STOP_SCHED_REL.get(int(srs), str(srs))
+                    trip_sr = TRIP_SCHED_REL.get(int(sr), str(sr))
                 except Exception:
-                    stop_sr = str(srs)
+                    trip_sr = str(sr)
 
-                rt_su_records.append({
+                if trip_id:
+                    rt_trip_ids.add(trip_id)
+
+                rt_trips_records.append({
                     "trip_id": trip_id,
-                    "stop_id": (stu.get("stop_id") or "").strip(),
-                    "stop_sequence": stu.get("stop_sequence"),
-                    "arrival_time": arr.get("time"),
-                    "departure_time": dep.get("time"),
-                    "arrival_delay": arr.get("delay"),
-                    "departure_delay": dep.get("delay"),
-                    "stop_status": stop_sr,
+                    "route_id": route_id,
+                    "start_date": start_date,
+                    "start_time": start_time,
+                    "rt_timestamp": int(ts) if ts else pd.NA,
+                    "trip_status": trip_sr,
+                    "is_deleted": is_deleted,
                 })
+
+                for stu in tu.get("stop_time_update", []):
+                    arr = stu.get("arrival", {}) or {}
+                    dep = stu.get("departure", {}) or {}
+                    srs = stu.get("schedule_relationship", 0)
+                    try:
+                        stop_sr = STOP_SCHED_REL.get(int(srs), str(srs))
+                    except Exception:
+                        stop_sr = str(srs)
+
+                    rt_su_records.append({
+                        "trip_id": trip_id,
+                        "stop_id": (stu.get("stop_id") or "").strip(),
+                        "stop_sequence": stu.get("stop_sequence"),
+                        "arrival_time": arr.get("time"),
+                        "departure_time": dep.get("time"),
+                        "arrival_delay": arr.get("delay"),
+                        "departure_delay": dep.get("delay"),
+                        "stop_status": stop_sr,
+                    })
+        except Exception:
+            # Si le JSON échoue aussi, on ne fait rien, les DataFrames seront vides
+            pass
 
     rt_trips = pd.DataFrame(rt_trips_records)
     rt_su = pd.DataFrame(rt_su_records)
