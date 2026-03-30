@@ -1,0 +1,13 @@
+services:
+  gtfsrt-analyzer:
+    build: .
+    container_name: gtfsrt-analyzer
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    restart: unless-stopped

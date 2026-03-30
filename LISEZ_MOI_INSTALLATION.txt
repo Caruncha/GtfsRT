@@ -1,0 +1,39 @@
+========================================================================
+       GUIDE D'INSTALLATION : ANALYSEUR GTFS-RT (WINDOWS)
+========================================================================
+
+Pour que n'importe qui puisse utiliser cet outil en local, voici 
+la procédure à suivre (une seule fois) :
+
+------------------------------------------------------------------------
+Étape 1 : Installer Python (si ce n'est pas déjà fait)
+------------------------------------------------------------------------
+1. Téléchargez Python sur : https://www.python.org/downloads/
+2. Lancez l'installateur.
+3. IMPORTANT : Cochez impérativement la case "Add Python to PATH" 
+   avant de cliquer sur "Install Now".
+
+------------------------------------------------------------------------
+Étape 2 : Lancer l'application
+------------------------------------------------------------------------
+1. Téléchargez et dézippez ce dossier n'importe où sur votre ordinateur.
+2. Double-cliquez sur le fichier : Lancer_Analyseur_GTFS.bat
+
+La première fois, le programme téléchargera automatiquement les 
+composants nécessaires (Streamlit, Pandas, etc.). 
+Ensuite, une page web s'ouvrira toute seule dans votre navigateur.
+
+------------------------------------------------------------------------
+Étape 3 : Configuration (Optionnel)
+------------------------------------------------------------------------
+Si vous devez utiliser des liens URL directs vers des flux GTFS-RT, 
+modifiez le fichier ".env" avec le Bloc-notes pour y insérer vos 
+clés d'API et liens.
+
+------------------------------------------------------------------------
+Astuce
+------------------------------------------------------------------------
+Vous pouvez faire un clic droit sur "Lancer_Analyseur_GTFS.bat" et 
+choisir "Envoyer vers -> Bureau (créer un raccourci)" pour y avoir 
+accès plus facilement.
+========================================================================

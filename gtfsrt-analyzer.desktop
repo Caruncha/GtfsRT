@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Terminal=true
+Name=Analyseur GTFS-RT
+Comment=Lancer l'application d'analyse GTFS-Realtime
+Exec=/home/umbrel/gtfsrt/start.sh
+Icon=utilities-terminal
+Categories=Development;
+Path=/home/umbrel/gtfsrt
