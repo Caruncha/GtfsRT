@@ -1003,6 +1003,7 @@ def chart_delay_distribution_per_minute(sched_vs_rt_with_delay: pd.DataFrame):
 
 WHEELCHAIR_LABELS = {0: "Inconnu", 1: "Accessible ♿", 2: "Non accessible"}
 WHEELCHAIR_BOARDING_LABELS = {0: "Inconnu / hérité", 1: "Accessible ♿", 2: "Non accessible"}
+BIKES_LABELS = {0: "Inconnu", 1: "Vélos autorisés 🚲", 2: "Vélos interdits"}
 
 
 def compute_accessibility(
