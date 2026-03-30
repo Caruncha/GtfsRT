@@ -1692,7 +1692,18 @@ def main():
                             if ch:
                                 st.altair_chart(ch, use_container_width=True)
 
-                    # Granularité par ligne
+                    # Détail tabulaire par voyage
+                    if not acc["trips"].empty:
+                        display_cols = [c for c in [
+                            "trip_id", "route_id", "route_short_name", "direction_id",
+                            "trip_status", "wheelchair_label", "bikes_label",
+                        ] if c in acc["trips"].columns]
+                        with st.expander("Détail accessibilité par voyage"):
+                            st.dataframe(acc["trips"][display_cols], use_container_width=True, height=300)
+
+                    # Granularité par ligne (DÉPLACÉ EN BAS)
+                    st.divider()
+                    st.write("📊 **Accessibilité par ligne / direction**")
                     ch_wc_route = chart_accessibility_by_route(
                         acc.get("wheelchair_by_route", pd.DataFrame()),
                         "Accessibilité ♿ par ligne / direction"
@@ -1706,15 +1717,6 @@ def main():
                     )
                     if ch_bike_route:
                         st.altair_chart(ch_bike_route, use_container_width=True)
-
-                    # Détail tabulaire par voyage
-                    if not acc["trips"].empty:
-                        display_cols = [c for c in [
-                            "trip_id", "route_id", "route_short_name", "direction_id",
-                            "trip_status", "wheelchair_label", "bikes_label",
-                        ] if c in acc["trips"].columns]
-                        with st.expander("Détail accessibilité par voyage"):
-                            st.dataframe(acc["trips"][display_cols], use_container_width=True, height=300)
 
             if show_raw_tables:
                 st.divider()
@@ -1742,6 +1744,16 @@ def main():
                 st.warning("Aucun véhicule trouvé dans le fichier VehiclePositions.")
             else:
                 st.success(f"Analyse VehiclePositions terminée ✅ — {len(vp_df):,} véhicules")
+
+                # Pré-jointure accessibilité pour affichage dans la table
+                if gtfs_bytes:
+                    vp_trip_ids_for_table: Set[str] = set(vp_df["trip_id"].dropna().astype(str).unique()) - {""}
+                    if vp_trip_ids_for_table:
+                        vpt_df = load_trips_filtered(gtfs_bytes, vp_trip_ids_for_table)
+                        if not vpt_df.empty:
+                            vpt_df["wheelchair_label"] = (vpt_df["wheelchair_accessible"].fillna(0)
+                                                          .astype(int).map(WHEELCHAIR_LABELS).fillna("Inconnu"))
+                            vp_df = pd.merge(vp_df, vpt_df[["trip_id", "wheelchair_label"]], on="trip_id", how="left")
 
                 # Métriques
                 total_veh = len(vp_df)
@@ -1782,6 +1794,7 @@ def main():
                 st.subheader("Détail par véhicule")
                 col_order = [c for c in [
                     "vehicle_id", "vehicle_label", "route_id", "trip_id",
+                    "wheelchair_label",  # AJOUTÉ
                     "current_status", "stop_id", "current_stop_sequence",
                     "latitude", "longitude", "bearing", "speed",
                     "occupancy_status", "occupancy_percentage",
@@ -1793,14 +1806,14 @@ def main():
                 # Accessibilité VP
                 # -------------------------
                 if gtfs_bytes:
-                    # Charger trips pour les véhicules du flux VP
+                    # On réutilise les DataFrames déjà chargés si possible
                     vp_trip_ids: Set[str] = set(
                         vp_df["trip_id"].dropna().astype(str).unique()
                     ) - {""}
                     if vp_trip_ids:
                         with st.spinner("Chargement accessibilité…"):
                             vp_trips_df = load_trips_filtered(gtfs_bytes, vp_trip_ids)
-                            vp_stops_df = pd.DataFrame()  # stops VP non chargés (optionnel)
+                            vp_stops_df = pd.DataFrame() 
 
                         vp_routes_df = load_routes_filtered(gtfs_bytes, set(vp_trips_df["route_id"].dropna().astype(str).unique()) - {""}) if not vp_trips_df.empty else pd.DataFrame()
                         acc_vp = compute_accessibility(vp_trips_df, vp_stops_df, vp_df.rename(columns={"current_status": "trip_status"}), vp_routes_df)
@@ -1827,6 +1840,13 @@ def main():
                                     ch = _accessibility_bar(acc_vp[key], title)
                                     if ch:
                                         st.altair_chart(ch, use_container_width=True)
+                            
+                            # Liste des véhicules sans info (INCONNU)
+                            if "trips" in acc_vp and not acc_vp["trips"].empty:
+                                unknown_acc_veh = acc_vp["trips"][acc_vp["trips"]["wheelchair_label"] == "Inconnu"]
+                                if not unknown_acc_veh.empty:
+                                    with st.expander(f"Voir les {len(unknown_acc_veh)} véhicules avec accessibilité 'Inconnu'"):
+                                        st.dataframe(unknown_acc_veh, use_container_width=True)
                         else:
                             st.info("Données d'accessibilité absentes du GTFS statique pour ces véhicules.")
 
@@ -1841,9 +1861,6 @@ def main():
     if rt_bytes and vp_bytes:
         tab_conc = tab_objects[tabs.index("Concordance TU ↔ VP")]
         with tab_conc:
-            # On a besoin des deux DataFrames — ils sont déjà calculés dans leurs onglets
-            # respectifs, mais on doit s'assurer qu'ils existent dans ce scope.
-            # On les re-parse (cache Streamlit évite le double calcul).
             with st.status("Calcul de la concordance…", expanded=False) as s_conc:
                 _rt_trips_c, _rt_su_c, _rt_ids_c = parse_tripupdates_rt(rt_bytes)
                 _vp_df_c = parse_vehiclepositions_rt(vp_bytes)
@@ -1873,12 +1890,6 @@ def main():
             with c7: st.metric("Véhicules VP sans trip_id", f"{conc.get('vp_no_trip_count', 0):,}")
 
             st.divider()
-
-            # Couverture par ligne
-            ch_cov = chart_concordance_coverage(conc.get("coverage_by_route", pd.DataFrame()))
-            if ch_cov:
-                st.subheader("Couverture par ligne")
-                st.altair_chart(ch_cov, use_container_width=True)
 
             # Divergences route_id par ligne
             ch_div = chart_concordance_divergences(
@@ -1930,6 +1941,13 @@ def main():
                                               "current_status","latitude","longitude"]
                                  if c in vp_no_trip_df.columns]
                     st.dataframe(vp_no_trip_df[show_cols], use_container_width=True, height=250)
+
+            # Couverture par ligne (DÉPLACÉ EN BAS)
+            st.divider()
+            ch_cov = chart_concordance_coverage(conc.get("coverage_by_route", pd.DataFrame()))
+            if ch_cov:
+                st.subheader("Couverture par ligne")
+                st.altair_chart(ch_cov, use_container_width=True)
 
     # Mémoire
     del gtfs_bytes, rt_bytes, vp_bytes
