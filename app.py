@@ -338,7 +338,12 @@ def parse_tripupdates_rt(rt_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, S
             pass
 
     rt_trips = pd.DataFrame(rt_trips_records)
+    if rt_trips.empty:
+        rt_trips = pd.DataFrame(columns=["trip_id", "route_id", "start_date", "start_time", "rt_timestamp", "trip_status", "is_deleted"])
+    
     rt_su = pd.DataFrame(rt_su_records)
+    if rt_su.empty:
+        rt_su = pd.DataFrame(columns=["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time", "arrival_delay", "departure_delay", "stop_status"])
 
     # Types légers
     if not rt_trips.empty:
