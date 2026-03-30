@@ -4,3 +4,5 @@ gtfs-realtime-bindings
 altair
 numpy
 tzdata
+requests
+python-dotenv
